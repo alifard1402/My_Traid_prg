@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# اطلاعات حساس - هرگز کامیت نشود
+.env
+*.key
+secrets.yaml
+
+# داده‌های دانلود شده و خروجی‌ها
+!data/cache/.gitkeep
+data/cache/*.csv
+data/cache/*.parquet
+reports/
+*.log
+data/paper_state.json
+data/*.json
