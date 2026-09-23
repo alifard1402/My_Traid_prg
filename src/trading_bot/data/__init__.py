@@ -6,15 +6,19 @@ from pathlib import Path
 
 import pandas as pd
 
-from .base import OHLCV_COLUMNS, DataSource, timeframe_to_minutes
+from .auto import AutoSource
+from .base import OHLCV_COLUMNS, DataSource, is_gold, timeframe_to_minutes
 from .binance import BinanceSource
 from .nobitex import NobitexSource
 from .sample import SampleSource
+from .yahoo import YahooSource
 
 SOURCES: dict[str, type[DataSource]] = {
-    "sample": SampleSource,
+    "auto": AutoSource,
     "nobitex": NobitexSource,
     "binance": BinanceSource,
+    "yahoo": YahooSource,
+    "sample": SampleSource,
 }
 
 CACHE_DIR = Path("data/cache")
@@ -68,7 +72,8 @@ def load_ohlcv(
 
 
 __all__ = [
-    "DataSource", "SampleSource", "NobitexSource", "BinanceSource",
+    "DataSource", "SampleSource", "NobitexSource", "BinanceSource", "YahooSource",
+    "AutoSource", "is_gold",
     "SOURCES", "get_source", "load_ohlcv", "load_cache", "save_cache",
     "cache_path", "timeframe_to_minutes", "OHLCV_COLUMNS",
 ]

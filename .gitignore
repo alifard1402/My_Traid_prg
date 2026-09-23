@@ -19,3 +19,5 @@ reports/
 *.log
 data/paper_state.json
 data/*.json
+data/.panel_secret
+data/*.tmp

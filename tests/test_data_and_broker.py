@@ -7,6 +7,7 @@ from trading_bot.broker import PaperBroker
 from trading_bot.config import Config
 from trading_bot.data import SampleSource, cache_path, load_cache, save_cache
 from trading_bot.data.base import OHLCV_COLUMNS
+from trading_bot.strategy import STRATEGIES
 
 
 # ───────────────────────── داده ─────────────────────────
@@ -135,9 +136,9 @@ def test_equity_marks_position_to_market(tmp_path):
 
 
 def test_config_loads_shipped_file():
-    cfg = Config.load("config.yaml")
-    assert cfg.market.symbol
-    assert cfg.strategy.name in ("ema_trend",)
+    cfg = Config.load("config.yaml", use_overrides=False)
+    assert cfg.market.symbol == "XAUUSD"
+    assert cfg.strategy.name in STRATEGIES
     assert 0 < cfg.risk.risk_per_trade <= 0.1
 
 

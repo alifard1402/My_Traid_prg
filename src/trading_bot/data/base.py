@@ -30,6 +30,14 @@ class DataSource(ABC):
 
     name: str = "base"
 
+    #: نام‌های مستعار نماد → نماد واقعی در این منبع (مثلاً XAUUSD → PAXGUSDT)
+    ALIASES: dict[str, str] = {}
+
+    def resolve_symbol(self, symbol: str) -> str:
+        """نماد عمومی را به نماد مخصوص این منبع ترجمه می‌کند."""
+        symbol = symbol.upper()
+        return self.ALIASES.get(symbol, symbol)
+
     @abstractmethod
     def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int = 1000) -> pd.DataFrame:
         """آخرین `limit` کندل را برمی‌گرداند.
@@ -61,6 +69,15 @@ class DataSource(ABC):
         if df.empty:
             raise ValueError(f"منبع {self.name} هیچ کندل سالمی برنگرداند.")
         return df
+
+
+#: نمادهایی که «طلا» حساب می‌شوند (برای ترجمه بین منابع مختلف)
+GOLD_ALIASES = ("XAUUSD", "GOLD", "XAU")
+
+
+def is_gold(symbol: str) -> bool:
+    s = symbol.upper()
+    return s in GOLD_ALIASES or "PAXG" in s or "XAUT" in s or s == "GC=F"
 
 
 def timeframe_to_minutes(timeframe: str) -> int:

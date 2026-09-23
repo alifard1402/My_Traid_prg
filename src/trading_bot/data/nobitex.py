@@ -12,7 +12,7 @@ import time
 import pandas as pd
 import requests
 
-from .base import DataSource, timeframe_to_minutes
+from .base import GOLD_ALIASES, DataSource, timeframe_to_minutes
 
 BASE_URL = "https://api.nobitex.ir"
 
@@ -30,6 +30,7 @@ RESOLUTION = {
 
 class NobitexSource(DataSource):
     name = "nobitex"
+    ALIASES = {alias: "PAXGUSDT" for alias in GOLD_ALIASES}
 
     def __init__(self, timeout: int = 30) -> None:
         self.timeout = timeout
@@ -45,7 +46,7 @@ class NobitexSource(DataSource):
 
         url = f"{BASE_URL}/market/udf/history"
         params = {
-            "symbol": symbol.upper(),
+            "symbol": self.resolve_symbol(symbol),
             "resolution": RESOLUTION[timeframe],
             "from": from_ts,
             "to": to_ts,

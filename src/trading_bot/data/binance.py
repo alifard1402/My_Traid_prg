@@ -9,9 +9,10 @@ from __future__ import annotations
 import pandas as pd
 import requests
 
-from .base import DataSource
+from .base import GOLD_ALIASES, DataSource
 
-BASE_URL = "https://api.binance.com"
+#: آدرس اصلی + آینه عمومی داده‌های بازار (گاهی وقتی اصلی مسدود است، آینه جواب می‌دهد)
+BASE_URLS = ("https://api.binance.com", "https://data-api.binance.vision")
 
 INTERVAL = {
     "1m": "1m",
@@ -26,6 +27,7 @@ INTERVAL = {
 
 class BinanceSource(DataSource):
     name = "binance"
+    ALIASES = {alias: "PAXGUSDT" for alias in GOLD_ALIASES}
 
     def __init__(self, timeout: int = 30) -> None:
         self.timeout = timeout
@@ -34,23 +36,25 @@ class BinanceSource(DataSource):
         if timeframe not in INTERVAL:
             raise ValueError(f"بایننس تایم‌فریم {timeframe} را پشتیبانی نمی‌کند.")
 
-        try:
-            resp = requests.get(
-                f"{BASE_URL}/api/v3/klines",
-                params={
-                    "symbol": symbol.upper(),
-                    "interval": INTERVAL[timeframe],
-                    "limit": min(limit, 1000),  # سقف مجاز بایننس در هر درخواست
-                },
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-            rows = resp.json()
-        except requests.RequestException as exc:
+        params = {
+            "symbol": self.resolve_symbol(symbol),
+            "interval": INTERVAL[timeframe],
+            "limit": min(limit, 1000),  # سقف مجاز بایننس در هر درخواست
+        }
+        last_error: Exception | None = None
+        for base_url in BASE_URLS:
+            try:
+                resp = requests.get(f"{base_url}/api/v3/klines", params=params, timeout=self.timeout)
+                resp.raise_for_status()
+                rows = resp.json()
+                break
+            except requests.RequestException as exc:
+                last_error = exc
+        else:
             raise ConnectionError(
-                f"اتصال به بایننس ناموفق بود: {exc}\n"
+                f"اتصال به بایننس ناموفق بود: {last_error}\n"
                 "اگر داخل ایران هستی این طبیعی است — از --source nobitex استفاده کن."
-            ) from exc
+            ) from last_error
 
         if not rows:
             raise ValueError(f"بایننس داده‌ای برای {symbol} برنگرداند.")

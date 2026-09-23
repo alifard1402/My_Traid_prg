@@ -14,6 +14,7 @@ class Order:
     price: float
     fee: float = 0.0
     timestamp: str = ""
+    reason: str = ""   # چرا: signal / stop_loss / take_profit / manual / ...
 
 
 class Broker(ABC):
@@ -22,10 +23,10 @@ class Broker(ABC):
     name: str = "base"
 
     @abstractmethod
-    def buy(self, symbol: str, quantity: float, price: float) -> Order: ...
+    def buy(self, symbol: str, quantity: float, price: float, reason: str = "") -> Order: ...
 
     @abstractmethod
-    def sell(self, symbol: str, quantity: float, price: float) -> Order: ...
+    def sell(self, symbol: str, quantity: float, price: float, reason: str = "") -> Order: ...
 
     @abstractmethod
     def equity(self, mark_price: float) -> float:

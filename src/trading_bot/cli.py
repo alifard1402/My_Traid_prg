@@ -6,6 +6,7 @@
   python -m trading_bot optimize    جست‌وجوی پارامترهای بهتر (با احتیاط!)
   python -m trading_bot paper       اجرای زنده با پول تقلبی
   python -m trading_bot status      وضعیت فعلی حساب کاغذی
+  python -m trading_bot web         پنل وب (داشبورد، بک‌تست، تنظیمات)
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import argparse
 import itertools
 import logging
 import sys
+from pathlib import Path
 
 import pandas as pd
 
@@ -23,6 +25,7 @@ from .data import SOURCES, cache_path, get_source, load_ohlcv, save_cache
 from .live import LiveTrader
 from .risk import RiskManager
 from .strategy import STRATEGIES, get_strategy
+from .web.auth import load_env_file
 
 
 def setup_logging(verbose: bool = False) -> None:
@@ -192,11 +195,14 @@ def cmd_paper(args: argparse.Namespace, cfg: Config) -> int:
     if args.reset:
         trader.broker.reset(cfg.risk.initial_capital)
         print(f"حساب کاغذی با سرمایه {cfg.risk.initial_capital:,.2f} صفر شد.")
+    if trader.broker.state.halted:
+        print("⛔ کلید قطع اضطراری زده شده. اول نتیجه را بررسی کن، بعد با --reset شروع کن.")
+        return 1
     try:
         trader.run(max_iterations=args.iterations)
     except KeyboardInterrupt:
         print("\nربات با دستور کاربر متوقف شد.")
-    return 0
+    return 1 if trader.broker.state.halted else 0
 
 
 def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
@@ -204,6 +210,38 @@ def cmd_status(args: argparse.Namespace, cfg: Config) -> int:
     m = cfg.market
     df = load_ohlcv(m.source, m.symbol, m.timeframe, limit=5)
     print(trader.summary(float(df["close"].iloc[-1])))
+    return 0
+
+
+def cmd_web(args: argparse.Namespace, cfg: Config) -> int:
+    import os
+
+    try:
+        import uvicorn
+    except ImportError:
+        print("پنل وب نصب نیست. اجرا کن:  pip install -r requirements.txt")
+        return 1
+
+    from .web.app import create_app
+    from .web.auth import MIN_PASSWORD_LENGTH
+
+    if len(os.environ.get("PANEL_PASSWORD", "")) < MIN_PASSWORD_LENGTH:
+        print(
+            "❌ رمز پنل تنظیم نشده (یا کوتاه‌تر از ۸ حرف است).\n"
+            "   در فایل .env (کنار config.yaml) این خط را بگذار:\n"
+            "   PANEL_PASSWORD=یک-رمز-طولانی-و-سخت"
+        )
+        return 1
+
+    host = args.host or os.environ.get("PANEL_HOST") or cfg.panel.host
+    port = int(args.port or os.environ.get("PANEL_PORT") or cfg.panel.port)
+    app = create_app(args.config)
+    print(f"پنل روی http://{host}:{port} بالا آمد. برای توقف Ctrl+C.")
+    if host == "0.0.0.0":
+        print("⚠️  پنل از همه‌جا در دسترس است. حتماً پشت HTTPS (nginx) یا فایروال باشد.")
+    # proxy_headers: پشت nginx، IP واقعی کاربر را برای قفل تلاش‌های ناموفق می‌خواهیم.
+    uvicorn.run(app, host=host, port=port, proxy_headers=True,
+                forwarded_allow_ips="127.0.0.1", log_level="warning")
     return 0
 
 
@@ -254,12 +292,18 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("status", help="وضعیت حساب کاغذی")
     p.set_defaults(func=cmd_status)
 
+    p = sub.add_parser("web", help="پنل وب (داشبورد، بک‌تست، تنظیمات)")
+    p.add_argument("--host", help="آدرس شنود (پیش‌فرض از config.yaml یا PANEL_HOST)")
+    p.add_argument("--port", type=int, help="پورت (پیش‌فرض ۸۰۰۰)")
+    p.set_defaults(func=cmd_web)
+
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     setup_logging(args.verbose)
+    load_env_file(Path(args.config).resolve().parent / ".env")
     try:
         cfg = Config.load(args.config)
         for attr in ("symbol", "timeframe", "source"):

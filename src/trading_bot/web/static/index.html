@@ -1,0 +1,428 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark light">
+  <title>ربات طلا</title>
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/app.css">
+  <script src="/static/vendor/lightweight-charts.standalone.production.js" defer></script>
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+
+<!-- ─────────────── ورود ─────────────── -->
+<section id="login-view" class="login" hidden>
+  <form id="login-form" class="login-card card">
+    <div class="brand brand-lg"><span class="brand-mark" aria-hidden="true"></span>ربات طلا</div>
+    <p class="muted">برای ورود، رمز پنل را وارد کن. رمز در فایل <code>.env</code> روی سرور است.</p>
+    <label class="field">
+      <span>رمز عبور</span>
+      <input id="login-password" type="password" autocomplete="current-password" required autofocus>
+    </label>
+    <button class="btn btn-primary btn-block" type="submit">ورود</button>
+    <p id="login-error" class="form-error" role="alert"></p>
+  </form>
+</section>
+
+<!-- ─────────────── برنامه ─────────────── -->
+<div id="app-view" hidden>
+  <header class="topbar">
+    <div class="brand"><span class="brand-mark" aria-hidden="true"></span>ربات طلا</div>
+    <nav class="tabs" role="tablist">
+      <a href="#dashboard" data-tab="dashboard" role="tab">داشبورد</a>
+      <a href="#backtest" data-tab="backtest" role="tab">بک‌تست</a>
+      <a href="#settings" data-tab="settings" role="tab">تنظیمات</a>
+      <a href="#guide" data-tab="guide" role="tab">راهنما</a>
+    </nav>
+    <div class="topbar-end">
+      <span class="pill pill-paper" title="هیچ سفارش واقعی به صرافی ارسال نمی‌شود">حالت کاغذی · پول تقلبی</span>
+      <button id="theme-toggle" class="btn btn-ghost btn-icon" type="button" aria-label="تغییر تم روشن/تیره">◐</button>
+      <button id="logout" class="btn btn-ghost" type="button">خروج</button>
+    </div>
+  </header>
+
+  <main class="container">
+
+    <!-- ═══════════════ داشبورد ═══════════════ -->
+    <section id="tab-dashboard" class="tab-panel">
+      <div class="hero">
+        <div class="card hero-price">
+          <div class="muted small"><span id="m-symbol">—</span> · <span id="m-timeframe">—</span> · منبع: <span id="m-source">—</span></div>
+          <div class="price-row">
+            <span id="m-price" class="price">—</span>
+            <span id="m-change" class="delta"></span>
+          </div>
+          <div class="muted small">قیمت هر اونس طلا · آخرین به‌روزرسانی <span id="m-updated">—</span></div>
+        </div>
+
+        <div class="card bot-card">
+          <div class="bot-head">
+            <div>
+              <div class="muted small">وضعیت ربات</div>
+              <div id="bot-state" class="bot-state"><span class="dot"></span><span class="label">—</span></div>
+            </div>
+            <div class="bot-actions">
+              <button id="bot-toggle" class="btn btn-primary" type="button">روشن کن</button>
+            </div>
+          </div>
+          <div class="muted small">استراتژی: <strong id="bot-strategy">—</strong></div>
+          <div id="bot-action" class="bot-action small"></div>
+          <div id="bot-error" class="form-error small"></div>
+        </div>
+      </div>
+
+      <div id="sample-warning" class="banner banner-warn" hidden>
+        ⚠️ منبع قیمت روی <strong>sample</strong> (داده مصنوعی) است؛ این قیمت‌ها واقعی نیستند.
+        از «تنظیمات → منبع قیمت» گزینه <strong>auto</strong> را انتخاب کن.
+      </div>
+
+      <div id="halted-banner" class="banner banner-bad" hidden>
+        <strong>⛔ کلید قطع اضطراری زده شد.</strong>
+        افت حساب از حد مجازی که در تنظیمات گذاشته بودی بیشتر شد و ربات خودش را متوقف کرد.
+        معاملات را بررسی کن؛ بعد از بخش «حساب» دکمه «ریست حساب» را بزن.
+      </div>
+
+      <div class="tiles">
+        <div class="card tile">
+          <div class="tile-label">ارزش کل حساب</div>
+          <div id="a-equity" class="tile-value">—</div>
+          <div id="a-return" class="tile-sub"></div>
+        </div>
+        <div class="card tile">
+          <div class="tile-label">سود/زیان قطعی</div>
+          <div id="a-realized" class="tile-value">—</div>
+          <div class="tile-sub muted">از معاملات بسته‌شده · کارمزد: <span id="a-fees" dir="ltr">—</span></div>
+        </div>
+        <div class="card tile">
+          <div class="tile-label" title="حساب الان چند درصد پایین‌تر از بالاترین ارزشی است که تا حالا داشته">افت از سقف</div>
+          <div id="a-dd" class="tile-value">—</div>
+          <div class="tile-sub muted">توقف خودکار در <span id="a-ddstop" dir="ltr">—</span></div>
+        </div>
+        <div class="card tile">
+          <div class="tile-label">معاملات</div>
+          <div id="a-trades" class="tile-value">—</div>
+          <div id="a-winrate" class="tile-sub muted"></div>
+        </div>
+      </div>
+
+      <div class="grid-main">
+        <div class="card chart-card">
+          <div class="card-head">
+            <h2>نمودار قیمت</h2>
+            <div id="price-legend" class="legend"></div>
+          </div>
+          <div id="price-chart" class="chart chart-lg" dir="ltr"></div>
+          <div id="price-hover" class="hover-readout small muted"></div>
+        </div>
+
+        <aside class="side">
+          <div class="card">
+            <h2>ربات الان چه فکر می‌کند؟</h2>
+            <ul id="checks" class="checks"><li class="muted">در حال بارگذاری…</li></ul>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>پوزیشن باز</h2>
+              <button id="close-position" class="btn btn-danger btn-sm" type="button" hidden>بستن دستی</button>
+            </div>
+            <div id="position" class="position muted">پوزیشن بازی نداری — ربات منتظر سیگنال خرید است.</div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2>حساب</h2>
+              <button id="reset-account" class="btn btn-ghost btn-sm" type="button">ریست حساب</button>
+            </div>
+            <dl class="kv small">
+              <dt>سرمایه اولیه</dt><dd id="a-initial">—</dd>
+              <dt>پول نقد</dt><dd id="a-cash">—</dd>
+              <dt>بالاترین ارزش</dt><dd id="a-peak">—</dd>
+            </dl>
+          </div>
+        </aside>
+      </div>
+
+      <div class="grid-2">
+        <div class="card">
+          <div class="card-head"><h2>منحنی سرمایه</h2><span class="muted small">ارزش حساب در پایان هر کندل</span></div>
+          <div id="equity-chart" class="chart chart-sm" dir="ltr"></div>
+          <p id="equity-empty" class="muted small empty">هنوز داده‌ای نیست. ربات را روشن کن تا ارزش حساب اینجا ثبت شود.</p>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>گزارش لحظه‌ای</h2><span class="muted small">آخرین کارهای ربات</span></div>
+          <div id="logs" class="logs" dir="rtl"></div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-head"><h2>معاملات کاغذی</h2></div>
+        <div class="table-wrap">
+          <table class="table">
+            <thead><tr><th>ورود</th><th>خروج</th><th>قیمت ورود</th><th>قیمت خروج</th><th>حجم (اونس)</th><th>سود/زیان</th><th>٪</th><th>دلیل خروج</th></tr></thead>
+            <tbody id="trades-body"><tr><td colspan="8" class="muted">هنوز معامله‌ای انجام نشده.</td></tr></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════ بک‌تست ═══════════════ -->
+    <section id="tab-backtest" class="tab-panel" hidden>
+      <div class="intro card">
+        <h2>بک‌تست چیست؟</h2>
+        <p>استراتژی را روی قیمت‌های <strong>گذشته</strong> طلا اجرا می‌کنیم تا ببینیم اگر از قبل با آن معامله کرده بودی چه می‌شد.
+          کارمزد و لغزش قیمت هم حساب می‌شود. نتیجه خوب <strong>تضمین آینده نیست</strong>، ولی نتیجه بد تقریباً همیشه یعنی «استفاده نکن».</p>
+      </div>
+
+      <form id="bt-form" class="card form-grid">
+        <label class="field">
+          <span>استراتژی</span>
+          <select id="bt-strategy"></select>
+        </label>
+        <label class="field">
+          <span>تایم‌فریم (طول هر کندل)</span>
+          <select id="bt-timeframe"></select>
+        </label>
+        <label class="field">
+          <span>تعداد کندل</span>
+          <input id="bt-limit" type="number" min="300" max="5000" step="100" value="2000">
+          <small class="muted">۲۰۰۰ کندل ۴ ساعته ≈ ۱۱ ماه</small>
+        </label>
+        <p id="bt-desc" class="span-all muted small"></p>
+        <div id="bt-params" class="span-all form-grid nested"></div>
+        <div class="span-all actions">
+          <button class="btn btn-primary" type="submit" id="bt-run">اجرای بک‌تست</button>
+          <button class="btn btn-ghost" type="button" id="bt-defaults">پارامترهای پیش‌فرض</button>
+          <span id="bt-status" class="muted small"></span>
+        </div>
+      </form>
+
+      <div id="bt-result" hidden>
+        <div id="bt-verdict" class="card verdict"></div>
+
+        <div class="tiles" id="bt-tiles"></div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>رشد سرمایه: ربات در برابر «خرید و نگه‌داری»</h2>
+            <div id="bt-eq-legend" class="legend"></div>
+          </div>
+          <div id="bt-equity-chart" class="chart chart-md" dir="ltr"></div>
+          <div id="bt-eq-hover" class="hover-readout small muted"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>نمودار قیمت و معاملات</h2><div id="bt-price-legend" class="legend"></div></div>
+          <div id="bt-price-chart" class="chart chart-md" dir="ltr"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <h2>معاملات بک‌تست</h2>
+            <button id="bt-apply" class="btn btn-primary btn-sm" type="button">استفاده از این تنظیمات برای ربات</button>
+          </div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead><tr><th>ورود</th><th>خروج</th><th>قیمت ورود</th><th>قیمت خروج</th><th>سود/زیان</th><th>٪</th><th>دلیل خروج</th><th>کندل</th></tr></thead>
+              <tbody id="bt-trades"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ═══════════════ تنظیمات ═══════════════ -->
+    <section id="tab-settings" class="tab-panel" hidden>
+      <form id="settings-form">
+        <div class="card">
+          <h2>بازار</h2>
+          <div class="form-grid">
+            <label class="field">
+              <span>چه چیزی معامله شود؟</span>
+              <select id="s-symbol"></select>
+              <small id="s-symbol-hint" class="muted"></small>
+            </label>
+            <label class="field">
+              <span>منبع قیمت</span>
+              <select id="s-source"></select>
+              <small id="s-source-hint" class="muted"></small>
+            </label>
+            <label class="field">
+              <span>تایم‌فریم</span>
+              <select id="s-timeframe"></select>
+              <small class="muted">برای شروع ۴ ساعته (4h) بهترین است: سیگنال کمتر ولی مطمئن‌تر، کارمزد کمتر.</small>
+            </label>
+          </div>
+          <div class="actions">
+            <button id="s-doctor" class="btn btn-ghost btn-sm" type="button">بررسی دسترسی سرور به منابع قیمت</button>
+          </div>
+          <div id="doctor-result" class="doctor"></div>
+        </div>
+
+        <div class="card">
+          <h2>استراتژی</h2>
+          <label class="field">
+            <span>کدام استراتژی؟</span>
+            <select id="s-strategy"></select>
+          </label>
+          <p id="s-strategy-desc" class="muted small"></p>
+          <div id="s-params" class="form-grid"></div>
+        </div>
+
+        <div class="card">
+          <h2>مدیریت ریسک <span class="muted small">— مهم‌ترین بخش</span></h2>
+          <div class="form-grid">
+            <label class="field">
+              <span>سرمایه اولیه (دلار)</span>
+              <input id="s-capital" type="number" min="10" step="10">
+              <small class="muted">پول تقلبی حساب کاغذی. بعد از تغییر، حساب را ریست کن تا اعمال شود.</small>
+            </label>
+            <label class="field">
+              <span>ریسک هر معامله (٪)</span>
+              <input id="s-risk" type="number" min="0.1" max="10" step="0.1">
+              <small class="muted">اگر حد ضرر بخورد، حداکثر چند درصد سرمایه از دست برود. حرفه‌ای‌ها ۰.۵ تا ۲٪.</small>
+            </label>
+            <label class="field">
+              <span>حداکثر سهم یک معامله از سرمایه (٪)</span>
+              <input id="s-maxpos" type="number" min="1" max="100" step="1">
+              <small class="muted">سقف پولی که در یک معامله وارد می‌شود. بالای ۱۰۰٪ ممکن نیست (اهرم نداریم).</small>
+            </label>
+            <label class="field">
+              <span>کلید قطع اضطراری (٪ افت)</span>
+              <input id="s-maxdd" type="number" min="5" max="90" step="1">
+              <small class="muted">اگر حساب این‌قدر از بالاترین ارزشش پایین بیاید، ربات همه‌چیز را می‌فروشد و خاموش می‌شود.</small>
+            </label>
+          </div>
+          <div id="risk-example" class="example"></div>
+        </div>
+
+        <div class="card">
+          <h2>هزینه‌ها و اجرا</h2>
+          <div class="form-grid">
+            <label class="field">
+              <span>کارمزد هر معامله (٪)</span>
+              <input id="s-fee" type="number" min="0" max="2" step="0.01">
+              <small class="muted">کارمزد صرافی‌ات را بگذار؛ کمی بدبینانه بهتر است.</small>
+            </label>
+            <label class="field">
+              <span>لغزش قیمت (٪)</span>
+              <input id="s-slip" type="number" min="0" max="2" step="0.01">
+              <small class="muted">فرق قیمتی که می‌بینی با قیمتی که واقعاً معامله می‌شود.</small>
+            </label>
+            <label class="field">
+              <span>فاصله بررسی قیمت (ثانیه)</span>
+              <input id="s-poll" type="number" min="5" max="3600" step="5">
+              <small class="muted">هر چند ثانیه ربات قیمت را چک کند. ۶۰ کافی است.</small>
+            </label>
+          </div>
+        </div>
+
+        <div class="card sticky-actions">
+          <button class="btn btn-primary" type="submit">ذخیره تنظیمات</button>
+          <button id="s-reset" class="btn btn-ghost" type="button">بازگشت به پیش‌فرض</button>
+          <span id="s-status" class="small"></span>
+        </div>
+      </form>
+    </section>
+
+    <!-- ═══════════════ راهنما ═══════════════ -->
+    <section id="tab-guide" class="tab-panel prose" hidden>
+      <div class="card">
+        <h2>از کجا شروع کنم؟</h2>
+        <ol class="steps">
+          <li><strong>تنظیمات → «بررسی دسترسی سرور»</strong> را بزن تا ببینی سرورت به کدام منبع قیمت دسترسی دارد.</li>
+          <li><strong>بک‌تست</strong>: هر سه استراتژی را روی ۲۰۰۰ تا ۳۰۰۰ کندل امتحان کن. به «قضاوت» بالای نتیجه دقت کن.</li>
+          <li>بهترین را با دکمه «استفاده از این تنظیمات برای ربات» انتخاب کن.</li>
+          <li><strong>داشبورد → روشن کن.</strong> ربات با پول تقلبی معامله می‌کند. سرور را می‌توانی ببندی؛ ربات روی سرور کار می‌کند.</li>
+          <li>حداقل <strong>۱ تا ۳ ماه</strong> صبر کن و نتیجه کاغذی را با بک‌تست مقایسه کن. اگر خیلی فرق داشت، بک‌تست گمراه‌کننده بوده.</li>
+        </ol>
+        <p class="banner banner-warn">⚠️ این ربات عمداً فقط با پول تقلبی کار می‌کند. هیچ ربات و استراتژی‌ای سود تضمینی ندارد؛ هر کس غیر از این گفت، دروغ می‌گوید.</p>
+      </div>
+
+      <div class="card">
+        <h2>واژه‌نامه — به زبان ساده</h2>
+        <dl class="glossary">
+          <dt>اونس (Ounce)</dt>
+          <dd>واحد جهانی وزن طلا؛ حدود ۳۱.۱ گرم. قیمت‌ها در این پنل «دلار برای هر اونس» است.</dd>
+          <dt>PAXG / XAUT</dt>
+          <dd>توکن‌های دیجیتال طلا. پشتوانه هر توکن یک اونس طلای واقعی در خزانه است، پس قیمتش تقریباً همان قیمت جهانی طلاست و در صرافی‌های رمزارز ۲۴ ساعته معامله می‌شود.</dd>
+          <dt>کندل (شمع)</dt>
+          <dd>خلاصه قیمت در یک بازه زمانی: قیمت اول (باز)، بالاترین، پایین‌ترین و آخر (بسته). کندل سبز یعنی قیمت در آن بازه بالا رفته، قرمز یعنی پایین آمده.</dd>
+          <dt>تایم‌فریم</dt>
+          <dd>طول زمانی هر کندل. 4h یعنی هر کندل ۴ ساعت است.</dd>
+          <dt>میانگین متحرک (EMA)</dt>
+          <dd>میانگین قیمت چند کندل آخر که با هر کندل جدید جلو می‌رود. نویز قیمت را صاف می‌کند تا جهت کلی دیده شود.</dd>
+          <dt>روند</dt>
+          <dd>جهت کلی حرکت قیمت در بلندمدت. «روند صعودی» یعنی قیمت‌ها در مجموع دارند بالا می‌روند.</dd>
+          <dt>ATR (میانگین دامنه واقعی)</dt>
+          <dd>میانگین اندازه حرکت قیمت در هر کندل — معیار «چقدر بازار شلوغ است». حد ضرر را بر اساس آن می‌گذاریم تا در بازار پرنوسان، زود بیرون نیفتیم.</dd>
+          <dt>RSI</dt>
+          <dd>عددی بین ۰ تا ۱۰۰ که می‌گوید قیمت اخیراً چقدر تند بالا یا پایین رفته. زیر ۳۰ یعنی «زیادی افت کرده»، بالای ۷۰ یعنی «زیادی بالا رفته».</dd>
+          <dt>پوزیشن</dt>
+          <dd>معامله‌ای که باز است؛ یعنی طلا خریده‌ای و هنوز نفروخته‌ای.</dd>
+          <dt>حد ضرر (Stop Loss)</dt>
+          <dd>قیمتی که اگر طلا به آن برسد، ربات بلافاصله می‌فروشد تا ضرر بیشتر نشود. مهم‌ترین ابزار زنده ماندن.</dd>
+          <dt>حد سود (Take Profit)</dt>
+          <dd>قیمتی که اگر طلا به آن برسد، ربات می‌فروشد و سود را قطعی می‌کند.</dd>
+          <dt>ریسک هر معامله</dt>
+          <dd>حداکثر درصدی از سرمایه که اگر حد ضرر بخورد از دست می‌رود. با ۱٪، حتی ۱۰ باخت پشت‌سرهم فقط حدود ۱۰٪ حساب را می‌برد.</dd>
+          <dt>افت سرمایه (Drawdown)</dt>
+          <dd>فاصله ارزش فعلی حساب از بالاترین ارزشی که داشته. «بیشترین افت» بدترین لحظه را نشان می‌دهد — یعنی چقدر باید اعصاب داشته باشی.</dd>
+          <dt>ضریب سوددهی (Profit Factor)</dt>
+          <dd>مجموع سودها تقسیم بر مجموع ضررها. بالای ۱ یعنی سود بیشتر از ضرر؛ بالای ۱.۵ خوب است.</dd>
+          <dt>نسبت شارپ</dt>
+          <dd>سود به ازای هر واحد ریسک. بالای ۱ خوب، بالای ۲ عالی، زیر ۰ بد.</dd>
+          <dt>خرید و نگه‌داری (Buy &amp; Hold)</dt>
+          <dd>ساده‌ترین استراتژی ممکن: روز اول بخر و دست نزن. هر رباتی باید از این بهتر باشد، وگرنه ارزش پیچیدگی‌اش را ندارد.</dd>
+          <dt>کارمزد و لغزش</dt>
+          <dd>صرافی از هر معامله درصدی برمی‌دارد (کارمزد) و قیمتی که واقعاً معامله می‌شود کمی بدتر از قیمت روی تابلوست (لغزش). هر دو در همه محاسبات این ربات کم می‌شوند.</dd>
+          <dt>بک‌تست</dt>
+          <dd>اجرای استراتژی روی قیمت‌های گذشته برای دیدن اینکه اگر قبلاً استفاده‌اش کرده بودی چه می‌شد.</dd>
+          <dt>بیش‌برازش (Overfitting)</dt>
+          <dd>آن‌قدر پارامترها را دست‌کاری کنی که روی گذشته عالی شود ولی در آینده کار نکند — مثل حفظ کردن جواب‌های یک آزمون. برای همین بک‌تست داده را دو نیمه می‌کند و جدا می‌سنجد.</dd>
+          <dt>معامله کاغذی (Paper Trading)</dt>
+          <dd>معامله با قیمت‌های واقعی و زنده، ولی با پول تقلبی. بهترین آزمون قبل از پول واقعی.</dd>
+        </dl>
+      </div>
+
+      <div class="card">
+        <h2>سه استراتژی داخل ربات</h2>
+        <div id="guide-strategies"></div>
+      </div>
+
+      <div class="card">
+        <h2>سؤال‌های رایج</h2>
+        <dl class="glossary">
+          <dt>چرا ربات چند روز است معامله نکرده؟</dt>
+          <dd>طبیعی است. در تایم‌فریم ۴ ساعته، استراتژی‌ها معمولاً ماهی چند معامله می‌کنند. بخش «ربات الان چه فکر می‌کند؟» می‌گوید منتظر چه شرطی است.</dd>
+          <dt>اگر سرور ری‌استارت شود چه؟</dt>
+          <dd>وضعیت حساب روی دیسک ذخیره است. سرویس خودکار بالا می‌آید و اگر ربات روشن بوده، دوباره روشن می‌شود.</dd>
+          <dt>چطور با پول واقعی معامله کنم؟</dt>
+          <dd>عمداً پیاده‌سازی نشده. اول ۱ تا ۳ ماه نتیجه کاغذی را ببین. اگر بعد از آن قانع شدی، با کمترین مبلغ ممکن و کلید API بدون دسترسی برداشت شروع کن.</dd>
+          <dt>قیمت اینجا با قیمت طلای بازار ایران فرق دارد؟</dt>
+          <dd>بله. اینجا قیمت جهانی (دلار برای هر اونس) است. قیمت طلای ۱۸ عیار در ایران به نرخ دلار آزاد هم بستگی دارد. برای قیمت ریالی، نماد PAXGIRT از نوبیتکس را انتخاب کن.</dd>
+        </dl>
+      </div>
+    </section>
+
+  </main>
+  <footer class="footer muted small">
+    فقط برای آموزش و پژوهش — معامله در بازارهای مالی ریسک از دست دادن سرمایه دارد.
+    <span id="version"></span>
+  </footer>
+</div>
+
+<div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+<div id="confirm" class="modal" hidden>
+  <div class="modal-card card" role="dialog" aria-modal="true" aria-labelledby="confirm-text">
+    <p id="confirm-text"></p>
+    <div class="actions">
+      <button id="confirm-yes" class="btn btn-danger" type="button">بله</button>
+      <button id="confirm-no" class="btn btn-ghost" type="button">انصراف</button>
+    </div>
+  </div>
+</div>
+</body>
+</html>
