@@ -5,13 +5,15 @@
 //|     - Support / resistance levels (clustered swing points)       |
 //|     - Trendlines (unbroken lines through swing lows / highs)     |
 //|     - Supply / demand zones (base + impulse)                     |
-//|     - Entry signals with alerts                                  |
+//|     - Liquidity sweeps and fair value gaps (SMC confluence)      |
+//|     - Entry signals with alerts + new-basket risk filters        |
 //|     - Basket manager: +$ take profit, recovery trades every -$,  |
 //|       basket target = ratio x worst drawdown, emergency stop     |
+//|     - Basket journal (CSV) and win/loss statistics               |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.00"
-#property description "GoldPilot Recovery v4 - S/R, trendlines, supply/demand signals + basket recovery manager"
+#property version   "4.10"
+#property description "GoldPilot Recovery v4.1 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
 
 enum ENUM_OPPOSITE_ACTION
 {
@@ -55,13 +57,27 @@ input int      MaxRetries            = 3;
 input string   s_signal              = "=== Entry signal ===";
 input ENUM_TIMEFRAMES SignalTF       = PERIOD_M15; // Entry timeframe (M5 or M15)
 input ENUM_TIMEFRAMES TrendTF        = PERIOD_H1;  // Higher timeframe trend filter
-input int      MinConfluence         = 1;      // Min reasons: level / zone / trendline (1-3)
+input int      MinConfluence         = 2;      // Min reasons: level / zone / trendline / sweep / FVG
 input bool     AutoTradeSignals      = true;   // Open first trade on signal automatically
 input bool     UseSessionFilter      = true;   // New baskets only inside session (server time)
 input int      SessionStartHour      = 10;     // 10-22 server = London open .. NY afternoon on GMT+2/+3 brokers
 input int      SessionEndHour        = 22;
 input string   NewsTimes             = "";     // Server times, ';' separated: 2026.10.02 15:30;2026.10.14 15:30
 input int      NewsBlockMinutes      = 30;     // No new basket this many minutes before/after news
+input bool     UseLiquiditySweep     = true;   // Confluence: wick through a swing high/low, close back inside
+input bool     UseFVG                = true;   // Confluence: price returns into a fair value gap
+input double   FVGMinATR             = 0.3;    // Min FVG size (x ATR)
+input int      FVGLookback           = 60;     // Bars searched for open FVGs
+
+//==================================================================
+//                     NEW-BASKET RISK FILTERS
+//==================================================================
+input string   s_filters             = "=== New-basket risk filters ===";
+input double   MaxATRRatio           = 2.0;    // Skip if ATR(14) > this x ATR(100) (news spikes). 0 = off
+input double   MaxDailyLossUSD       = 150.0;  // No new basket today after this closed loss. 0 = off
+input bool     UseFridayCutoff       = true;   // Weekend gap protection
+input int      FridayCutoffHour      = 20;     // No new basket on Friday from this server hour
+input bool     WriteJournal          = true;   // Log every basket to MQL4/Files/GoldPilot_baskets.csv
 
 //==================================================================
 //                           ANALYSIS
@@ -88,6 +104,7 @@ input bool     DrawLevels            = true;
 input bool     DrawTrendlines        = true;
 input bool     DrawZones             = true;
 input bool     DrawSignals           = true;
+input bool     DrawFVGs              = true;
 input int      MaxLevelsEachSide     = 3;
 input int      MaxZonesEachSide      = 2;
 input bool     EnableAlerts          = true;
@@ -100,6 +117,7 @@ input color    ColorSupport          = clrDodgerBlue;
 input color    ColorResistance       = clrOrangeRed;
 input color    ColorDemand           = C'0,60,0';
 input color    ColorSupply           = C'70,0,0';
+input color    ColorFVG              = C'45,45,95';
 
 //==================================================================
 //                         CONSTANTS / TYPES
@@ -108,6 +126,7 @@ input color    ColorSupply           = C'70,0,0';
 #define BTN_BUY    "GPR_btnBuy"
 #define BTN_SELL   "GPR_btnSell"
 #define BTN_CLOSE  "GPR_btnClose"
+#define JOURNAL    "GoldPilot_baskets.csv"
 
 struct SwingPt
 {
@@ -131,6 +150,15 @@ struct SDZone
    int    tests;      // times price came back into the zone
 };
 
+struct FVGap
+{
+   int    kind;       // +1 bullish, -1 bearish
+   double top;
+   double bottom;
+   int    shift;      // middle candle
+   bool   filled;     // filled by bar 1 (still drawn until then)
+};
+
 struct TLine
 {
    bool   valid;
@@ -149,6 +177,7 @@ struct BasketInfo
    double   fees;          // swap + commission
    double   profit;        // profit + swap + commission
    int      lastTicket;
+   datetime firstTime;
    datetime lastTime;
    double   lastProfit;
    double   lastLots;
@@ -165,6 +194,8 @@ SwingPt  gSwH[], gSwL[];
 SRLevel  gLevels[];
 SDZone   gZones[];
 TLine    gTLUp, gTLDn;
+FVGap    gFVG[];
+double   gATRRatio = 0;
 int      gHTF = 0, gStruct = 0, gTrend = 0;
 double   gATR = 0;
 
@@ -182,6 +213,11 @@ datetime gLastOpenTry[2];
 datetime gPauseUntil = 0;
 bool     gOppAlerted = false;
 datetime gNews[];
+
+datetime gBasketStart[2];
+string   gCloseReason[2];
+int      gWins = 0, gLosses = 0, gStops = 0;
+double   gNet = 0, gWorstEver = 0;
 
 //==================================================================
 //                            UTILITY
@@ -360,7 +396,10 @@ int OnInit()
       gAlertedTicket[i]   = 0;
       gMaxAlerted[i]      = false;
       gLastOpenTry[i]     = 0;
+      gBasketStart[i]     = 0;
+      gCloseReason[i]     = "";
    }
+   if(IsTesting() && WriteJournal) FileDelete(JOURNAL);   // fresh journal per test run
 
    ParseNews();
    ObjectsDeleteAll(0, PREFIX);
@@ -372,13 +411,15 @@ int OnInit()
    gLastBar = iTime(NULL, SignalTF, 1);
    UpdateDashboard();
 
-   Print("GoldPilot Recovery v4 started on ", Symbol(), " ", TFName(SignalTF),
+   Print("GoldPilot Recovery v4.1 started on ", Symbol(), " ", TFName(SignalTF),
          " | $1 price move per 1 lot = ", DoubleToString(ValuePerPrice(), 2));
    return(INIT_SUCCEEDED);
 }
 
 void OnDeinit(const int reason)
 {
+   Print(StringFormat("GoldPilot stats: baskets %d won / %d lost (emergency stops %d) | net %+.2f | worst basket drawdown %.2f",
+                      gWins, gLosses, gStops, gNet, gWorstEver));
    EventKillTimer();
    ObjectsDeleteAll(0, PREFIX);
    ChartRedraw(0);
@@ -439,12 +480,15 @@ void RunAnalysis()
       gA[s] = iATR(NULL, SignalTF, ATRPeriod, s);
    }
    gATR = gA[1];
+   double atrSlow = iATR(NULL, SignalTF, 100, 1);
+   gATRRatio = (atrSlow > 0) ? gATR / atrSlow : 0;
 
    FindSwings();
    FindLevels();
    FindTrendline(true, gTLUp);
    FindTrendline(false, gTLDn);
    FindZones();
+   FindFVGs();
    ComputeTrend();
    ComputeSignal();
 }
@@ -692,6 +736,76 @@ int NearestZone(int kind, double price)
    return(best);
 }
 
+//---------------------- smart-money confluences --------------------
+// Fair value gap: 3-candle imbalance. Bullish when the newer candle's low
+// stays above the older candle's high (price skipped that range).
+// Gaps already filled before bar 1 are dropped.
+void FindFVGs()
+{
+   ArrayResize(gFVG, 0);
+   int last = (int)MathMin(FVGLookback, gN - 1);
+   for(int s = 2; s <= last; s++)   // s = middle candle, s-1 newer, s+1 older
+   {
+      int kind = 0;
+      double top = 0, bottom = 0;
+      if(gL[s - 1] > gH[s + 1] && gC[s] > gO[s])      { kind = 1;  bottom = gH[s + 1]; top = gL[s - 1]; }
+      else if(gH[s - 1] < gL[s + 1] && gC[s] < gO[s]) { kind = -1; top = gL[s + 1]; bottom = gH[s - 1]; }
+      else continue;
+      if(top - bottom < FVGMinATR * gA[s]) continue;
+
+      bool filledBefore = false;
+      for(int k = s - 2; k >= 2; k--)
+      {
+         if(kind == 1 && gL[k] <= bottom) { filledBefore = true; break; }
+         if(kind == -1 && gH[k] >= top)   { filledBefore = true; break; }
+      }
+      if(filledBefore) continue;
+
+      int n = ArraySize(gFVG);
+      ArrayResize(gFVG, n + 1);
+      gFVG[n].kind = kind;
+      gFVG[n].top = top;
+      gFVG[n].bottom = bottom;
+      gFVG[n].shift = s;
+      gFVG[n].filled = (kind == 1) ? (gL[1] <= bottom) : (gH[1] >= top);
+   }
+}
+
+// Most recent open FVG (formed before bar 1) that bar 1 traded into and closed back out of.
+int FVGAt(int kind, double extreme, double close)
+{
+   for(int i = 0; i < ArraySize(gFVG); i++)   // most recent first
+   {
+      if(gFVG[i].kind != kind || gFVG[i].shift < 3) continue;
+      if(kind == 1 && extreme <= gFVG[i].top && close > gFVG[i].bottom) return(i);
+      if(kind == -1 && extreme >= gFVG[i].bottom && close < gFVG[i].top) return(i);
+   }
+   return(-1);
+}
+
+// Liquidity sweep: bar 1 wicks through one of the last 3 swing lows (highs)
+// but closes back above (below) it - stops were taken, price rejected.
+int SweptSwing(bool lows, double extreme, double close)
+{
+   int n = lows ? ArraySize(gSwL) : ArraySize(gSwH);
+   for(int i = n - 1; i >= 0 && i >= n - 3; i--)
+   {
+      double p = lows ? gSwL[i].price : gSwH[i].price;
+      int    sh = lows ? gSwL[i].shift : gSwH[i].shift;
+      if(lows && !(extreme < p && close > p)) continue;
+      if(!lows && !(extreme > p && close < p)) continue;
+
+      bool brokenEarlier = false;   // level must still have been intact before bar 1
+      for(int k = sh - 1; k >= 2; k--)
+      {
+         if(lows && gC[k] < p)  { brokenEarlier = true; break; }
+         if(!lows && gC[k] > p) { brokenEarlier = true; break; }
+      }
+      if(!brokenEarlier) return(i);
+   }
+   return(-1);
+}
+
 //------------------------------ trend ------------------------------
 void ComputeTrend()
 {
@@ -762,6 +876,21 @@ void ComputeSignal()
             lowest = MathMin(lowest, v);
          }
       }
+      if(UseLiquiditySweep && SweptSwing(true, l1, c1) >= 0)
+      {
+         count++;
+         reasons += "Sweep low; ";
+      }
+      if(UseFVG)
+      {
+         int fi = FVGAt(1, l1, c1);
+         if(fi >= 0)
+         {
+            count++;
+            reasons += StringFormat("FVG %s-%s; ", Px(gFVG[fi].bottom), Px(gFVG[fi].top));
+            lowest = MathMin(lowest, gFVG[fi].bottom);
+         }
+      }
       if(count < MinConfluence || count == 0) return;
       gSigSide = 1;
       gSigEntry = c1;
@@ -797,6 +926,21 @@ void ComputeSignal()
             highest = MathMax(highest, v2);
          }
       }
+      if(UseLiquiditySweep && SweptSwing(false, h1, c1) >= 0)
+      {
+         count++;
+         reasons += "Sweep high; ";
+      }
+      if(UseFVG)
+      {
+         int fi2 = FVGAt(-1, h1, c1);
+         if(fi2 >= 0)
+         {
+            count++;
+            reasons += StringFormat("FVG %s-%s; ", Px(gFVG[fi2].bottom), Px(gFVG[fi2].top));
+            highest = MathMax(highest, gFVG[fi2].top);
+         }
+      }
       if(count < MinConfluence || count == 0) return;
       gSigSide = -1;
       gSigEntry = c1;
@@ -817,11 +961,45 @@ void AnnounceSignal()
    if(DrawSignals) DrawSignalArrow();
 }
 
+double TodayClosedPL()
+{
+   datetime dayStart = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
+   double sum = 0;
+   for(int i = OrdersHistoryTotal() - 1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if(OrderType() != OP_BUY && OrderType() != OP_SELL) continue;
+      if(!IsManaged() || OrderCloseTime() < dayStart) continue;
+      sum += OrderProfit() + OrderSwap() + OrderCommission();
+   }
+   return(sum);
+}
+
+// Why a NEW basket may not start now ("" = allowed). Open baskets are always managed.
+string EntryBlockReason()
+{
+   if(TimeCurrent() < gPauseUntil) return("pause after stop");
+   if(!InSession()) return(StringFormat("session %02d-%02d", SessionStartHour, SessionEndHour));
+   datetime news = NearNews();
+   if(news > 0) return("news " + TimeToString(news, TIME_MINUTES));
+   if(UseFridayCutoff && TimeDayOfWeek(TimeCurrent()) == 5 && TimeHour(TimeCurrent()) >= FridayCutoffHour)
+      return("Friday cutoff");
+   if(MaxATRRatio > 0 && gATRRatio > MaxATRRatio)
+      return(StringFormat("volatility x%.1f", gATRRatio));
+   if(MaxDailyLossUSD > 0 && TodayClosedPL() <= -MaxDailyLossUSD) return("daily loss limit");
+   if(!SpreadOK()) return("spread");
+   return("");
+}
+
 void TryAutoEntry()
 {
    if(gSigSide == 0) return;
-   if(TimeCurrent() < gPauseUntil) return;
-   if(!InSession() || NearNews() > 0 || !SpreadOK()) return;
+   string block = EntryBlockReason();
+   if(block != "")
+   {
+      Print("Signal skipped: ", block);
+      return;
+   }
 
    BasketInfo b, s;
    ScanBasket(OP_BUY, b);
@@ -886,7 +1064,7 @@ void EnforceOneDirection()
 void ScanBasket(int type, BasketInfo &b)
 {
    b.count = 0; b.lots = 0; b.sumLotsOpen = 0; b.fees = 0; b.profit = 0;
-   b.lastTicket = -1; b.lastTime = 0; b.lastProfit = 0; b.lastLots = 0;
+   b.lastTicket = -1; b.firstTime = 0; b.lastTime = 0; b.lastProfit = 0; b.lastLots = 0;
    b.lastOpen = 0; b.lastFees = 0;
 
    for(int i = OrdersTotal() - 1; i >= 0; i--)
@@ -901,6 +1079,7 @@ void ScanBasket(int type, BasketInfo &b)
       b.sumLotsOpen += OrderLots() * OrderOpenPrice();
       b.fees        += fee;
       b.profit      += pr;
+      if(b.firstTime == 0 || OrderOpenTime() < b.firstTime) b.firstTime = OrderOpenTime();
 
       if(OrderOpenTime() > b.lastTime ||
          (OrderOpenTime() == b.lastTime && OrderTicket() > b.lastTicket))
@@ -939,6 +1118,7 @@ void ManageBasket(int type)
 
    if(b.count == 0)
    {
+      if(gBasketStart[idx] > 0) FinishBasket(type);
       if(gWorst[idx] != 0) { gWorst[idx] = 0; SaveWorst(idx); }
       gAlertedTicket[idx]   = 0;
       gMaxAlerted[idx]      = false;
@@ -946,25 +1126,24 @@ void ManageBasket(int type)
       return;
    }
 
+   if(gBasketStart[idx] == 0) { gBasketStart[idx] = b.firstTime; gCloseReason[idx] = ""; }
    if(b.profit < gWorst[idx]) { gWorst[idx] = b.profit; SaveWorst(idx); }
    double target = Target(idx);
 
-   // 1) Target reached -> close the whole basket.
+   // 1) Target reached -> close the whole basket (result is reported by FinishBasket).
    if(b.profit >= target)
    {
-      int n = CloseBasket(type);
-      Notify(StringFormat("%s %s basket closed at target: %+.2f (%d trades, worst %.2f)",
-                          Symbol(), Side(type), b.profit, n, gWorst[idx]));
+      gCloseReason[idx] = "target";
+      CloseBasket(type);
       return;
    }
 
    // 2) Emergency stop.
    if(b.profit <= -MaxBasketLossUSD)
    {
-      int n2 = CloseBasket(type);
+      gCloseReason[idx] = "stop";
       gPauseUntil = TimeCurrent() + PauseAfterStopMinutes * 60;
-      Notify(StringFormat("EMERGENCY STOP %s %s basket: %.2f (%d trades closed)",
-                          Symbol(), Side(type), b.profit, n2));
+      CloseBasket(type);
       return;
    }
 
@@ -1004,6 +1183,73 @@ void ManageBasket(int type)
 
    // 4) Keep TP / SL on the server in sync (protects the basket if MT4 disconnects).
    if(SetBrokerTPSL) SyncTPSL(type, b, target);
+}
+
+// Called once when a basket has no open trades left: sums its closed
+// trades from history, updates the statistics and writes the journal.
+// Note: live, set the Account History tab to "All History" so MT4 keeps
+// the whole basket in OrdersHistoryTotal().
+void FinishBasket(int type)
+{
+   int idx = Idx(type);
+   double result = 0;
+   int trades = 0;
+   datetime lastClose = 0;
+   for(int i = OrdersHistoryTotal() - 1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if(OrderType() != type || !IsManaged()) continue;
+      if(OrderOpenTime() < gBasketStart[idx]) continue;
+      result += OrderProfit() + OrderSwap() + OrderCommission();
+      trades++;
+      if(OrderCloseTime() > lastClose) lastClose = OrderCloseTime();
+   }
+
+   string reason = gCloseReason[idx];
+   if(reason == "")   // closed on the server (TP/SL) or by hand
+   {
+      if(result >= 0) reason = "target (server)";
+      else if(result <= -0.8 * MaxBasketLossUSD) reason = "stop (server)";
+      else reason = "manual";
+   }
+   bool stopped = (StringFind(reason, "stop") >= 0);
+   double worst = MathMin(gWorst[idx], result);
+
+   if(result >= 0) gWins++; else gLosses++;
+   if(stopped)
+   {
+      gStops++;
+      gPauseUntil = TimeCurrent() + PauseAfterStopMinutes * 60;
+   }
+   gNet += result;
+   gWorstEver = MathMin(gWorstEver, worst);
+
+   Notify(StringFormat("%s%s %s basket closed (%s): %+.2f | %d trades | worst %.2f",
+                       stopped ? "EMERGENCY STOP - " : "", Symbol(), Side(type), reason,
+                       result, trades, worst));
+   if(WriteJournal)
+      WriteJournalRow(type, gBasketStart[idx], lastClose > 0 ? lastClose : TimeCurrent(),
+                      trades, worst, result, reason);
+
+   gBasketStart[idx] = 0;
+   gCloseReason[idx] = "";
+}
+
+void WriteJournalRow(int type, datetime start, datetime end, int trades,
+                     double worst, double result, string reason)
+{
+   int h = FileOpen(JOURNAL, FILE_CSV | FILE_READ | FILE_WRITE | FILE_SHARE_READ, ',');
+   if(h == INVALID_HANDLE)
+   {
+      Print("Journal: cannot open ", JOURNAL, ", error ", GetLastError());
+      return;
+   }
+   if(FileSize(h) == 0)
+      FileWrite(h, "open_time", "close_time", "symbol", "side", "trades", "worst", "result", "reason", "minutes");
+   FileSeek(h, 0, SEEK_END);
+   FileWrite(h, TimeToString(start), TimeToString(end), Symbol(), Side(type), trades,
+             DoubleToString(worst, 2), DoubleToString(result, 2), reason, (int)((end - start) / 60));
+   FileClose(h);
 }
 
 void SyncTPSL(int type, BasketInfo &b, double target)
@@ -1193,6 +1439,8 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
    }
    else if(Confirm("Close ALL managed " + Symbol() + " trades?"))
    {
+      gCloseReason[0] = "manual";
+      gCloseReason[1] = "manual";
       int n = CloseBasket(OP_BUY);
       n += CloseBasket(OP_SELL);
       Notify(StringFormat("CLOSE ALL: %d trades closed", n));
@@ -1239,6 +1487,7 @@ void DrawAnalysis()
    ObjectsDeleteAll(0, PREFIX + "LV_");
    ObjectsDeleteAll(0, PREFIX + "ZN_");
    ObjectsDeleteAll(0, PREFIX + "TL_");
+   ObjectsDeleteAll(0, PREFIX + "FV_");
    if(gN < 50) return;
 
    if(DrawLevels)
@@ -1266,6 +1515,27 @@ void DrawAnalysis()
          ObjectSetString(0, name, OBJPROP_TEXT,
                          StringFormat("%s tests:%d", dem ? "Demand" : "Supply", gZones[i].tests));
          if(dem) nd++; else ns++;
+      }
+   }
+
+   if(DrawFVGs)
+   {
+      datetime fvRight = iTime(NULL, SignalTF, 0) + PeriodSeconds(SignalTF) * 5;
+      int nb = 0, nr = 0;
+      for(int f = 0; f < ArraySize(gFVG); f++)   // most recent first
+      {
+         if(gFVG[f].filled) continue;
+         bool bull = (gFVG[f].kind == 1);
+         if(bull && nb >= MaxZonesEachSide) continue;
+         if(!bull && nr >= MaxZonesEachSide) continue;
+         string fname = PREFIX + "FV_" + IntegerToString(f);
+         ObjectCreate(0, fname, OBJ_RECTANGLE, 0,
+                      iTime(NULL, SignalTF, gFVG[f].shift + 1), gFVG[f].top, fvRight, gFVG[f].bottom);
+         ObjectSetInteger(0, fname, OBJPROP_COLOR, ColorFVG);
+         ObjectSetInteger(0, fname, OBJPROP_BACK, true);
+         ObjectSetInteger(0, fname, OBJPROP_SELECTABLE, false);
+         ObjectSetString(0, fname, OBJPROP_TEXT, bull ? "Bullish FVG" : "Bearish FVG");
+         if(bull) nb++; else nr++;
       }
    }
 
@@ -1364,7 +1634,7 @@ void UpdateDashboard()
    int y = DashY;
    string tf = TFName(SignalTF);
 
-   Row(y, "title", "GoldPilot Recovery v4  " + Symbol() + " " + tf, clrGold);
+   Row(y, "title", "GoldPilot Recovery v4.1  " + Symbol() + " " + tf, clrGold);
 
    string trendTxt = (gTrend > 0) ? "BULLISH" : (gTrend < 0) ? "BEARISH" : "NEUTRAL - wait";
    Row(y, "trend", "Trend: " + trendTxt, TrendColor(gTrend));
@@ -1415,19 +1685,13 @@ void UpdateDashboard()
    double riskPct = (bal > 0) ? MaxBasketLossUSD / bal * 100 : 0;
    Row(y, "risk", StringFormat("Emergency stop = %.1f%% of balance", riskPct),
        riskPct > 20 ? clrRed : riskPct > 10 ? clrOrange : clrSilver);
-   if(TimeCurrent() < gPauseUntil)
-      Row(y, "pause", "Auto entries paused after emergency stop", clrOrange);
-   else
-      Row(y, "pause", " ", clrGray);
-
-   datetime news = NearNews();
-   if(news > 0)
-      Row(y, "sess", "News " + TimeToString(news, TIME_MINUTES) + " - no new basket", clrOrange);
-   else if(!InSession())
-      Row(y, "sess", StringFormat("Outside session %02d-%02d - no new basket",
-                                  SessionStartHour, SessionEndHour), clrOrange);
-   else
-      Row(y, "sess", "Session open", clrSilver);
+   string block = EntryBlockReason();
+   Row(y, "entry", block == "" ? "New basket: allowed" : "New basket: blocked (" + block + ")",
+       block == "" ? clrLime : clrOrange);
+   Row(y, "vol", StringFormat("Volatility ATR x%.2f | Today closed %+.2f", gATRRatio, TodayClosedPL()),
+       clrSilver);
+   Row(y, "stats", StringFormat("Baskets %dW/%dL stops %d net %+.2f", gWins, gLosses, gStops, gNet),
+       clrSilver);
 
    ChartRedraw(0);
 }
