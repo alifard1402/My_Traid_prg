@@ -12,10 +12,12 @@
 //|     - Basket journal (CSV) and win/loss statistics               |
 //|     - v4.2: per-direction cooldown after a stop, weekend close,  |
 //|       optional ATR-based recovery step                           |
+//|     - v4.3: no new basket in a quiet market or on Friday         |
+//|       (tested on 2025 and 2026 separately, see sim/RESULTS.md)   |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.21"
-#property description "GoldPilot Recovery v4.21 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
+#property version   "4.30"
+#property description "GoldPilot Recovery v4.3 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
 
 enum ENUM_STEP_MODE
 {
@@ -85,9 +87,10 @@ input int      FVGLookback           = 60;     // Bars searched for open FVGs
 //==================================================================
 input string   s_filters             = "=== New-basket risk filters ===";
 input double   MaxATRRatio           = 2.0;    // Skip if ATR(14) > this x ATR(100) (news spikes). 0 = off
+input double   MinATRRatio           = 0.8;    // Skip if ATR(14) < this x ATR(100) (quiet market). 0 = off
 input double   MaxDailyLossUSD       = 150.0;  // No new basket today after this closed loss. 0 = off
 input bool     UseFridayCutoff       = true;   // Weekend gap protection
-input int      FridayCutoffHour      = 16;     // No new basket on Friday from this server hour
+input int      FridayCutoffHour      = 0;      // No new basket on Friday from this server hour (0 = all Friday)
 input int      DirectionCooldownHours = 24;    // After an emergency stop, no new basket in THAT direction. 0 = off
 input bool     CloseBeforeWeekend    = true;   // Friday: close the basket if it is not deep in loss
 input int      WeekendCloseHour      = 21;     // Friday server hour for the weekend close
@@ -470,7 +473,7 @@ int OnInit()
    UpdateDashboard();
 
    DataCheck();
-   Print("GoldPilot Recovery v4.21 started on ", Symbol(), " ", TFName(SignalTF),
+   Print("GoldPilot Recovery v4.3 started on ", Symbol(), " ", TFName(SignalTF),
          " | $1 price move per 1 lot = ", DoubleToString(ValuePerPrice(), 2));
    return(INIT_SUCCEEDED);
 }
@@ -1123,6 +1126,8 @@ string EntryBlockReason()
       return("Friday cutoff");
    if(MaxATRRatio > 0 && gATRRatio > MaxATRRatio)
       return(StringFormat("volatility x%.1f", gATRRatio));
+   if(MinATRRatio > 0 && gATRRatio > 0 && gATRRatio < MinATRRatio)
+      return(StringFormat("quiet x%.2f", gATRRatio));
    if(MaxDailyLossUSD > 0 && TodayClosedPL() <= -MaxDailyLossUSD) return("daily loss limit");
    if(!SpreadOK()) return("spread");
    return("");
@@ -1805,7 +1810,7 @@ void UpdateDashboard()
    int y = DashY;
    string tf = TFName(SignalTF);
 
-   Row(y, "title", "GoldPilot Recovery v4.21  " + Symbol() + " " + tf, clrGold);
+   Row(y, "title", "GoldPilot Recovery v4.3  " + Symbol() + " " + tf, clrGold);
 
    string trendTxt = (gTrend > 0) ? "BULLISH" : (gTrend < 0) ? "BEARISH" : "NEUTRAL - wait";
    Row(y, "trend", "Trend: " + trendTxt, TrendColor(gTrend));

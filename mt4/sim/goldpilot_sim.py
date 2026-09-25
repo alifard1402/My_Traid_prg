@@ -1,4 +1,4 @@
-"""GoldPilot Recovery v4.2 — Python simulator for fast what-if backtests.
+"""GoldPilot Recovery v4.3 — Python simulator for fast what-if backtests.
 
 The MT4 Strategy Tester is the reference. This simulator re-implements the
 EA's logic so many parameter sets can be compared in minutes:
@@ -50,6 +50,12 @@ class Params:
     min_confluence: int = 2
     use_sweep: bool = True
     use_fvg: bool = True
+    use_tl: bool = True                 # count the trendline as a reason
+    require_fvg: bool = False
+    use_d1_filter: bool = False         # no new basket against the D1 EMA trend
+    min_atr_ratio: float = 0.8          # no new basket when ATR14/ATR100 is below this
+    add_on_bar_close: bool = False      # recovery trade only at the close of an M15 bar
+    max_weekly_loss_usd: float = 0.0    # no new basket for the rest of the week after this closed loss
     use_session: bool = True
     session_start: int = 10
     session_end: int = 22
@@ -57,7 +63,7 @@ class Params:
     max_atr_ratio: float = 2.0
     max_daily_loss_usd: float = 150.0
     use_friday_cutoff: bool = True
-    friday_cutoff_hour: int = 16
+    friday_cutoff_hour: int = 0
     direction_cooldown_h: int = 24
     close_before_weekend: bool = True
     weekend_close_hour: int = 21
@@ -181,6 +187,7 @@ class SignalRow:
     sweep: bool
     fvg: bool
     atr_ratio: float
+    d1: int = 0               # D1 trend (EMA20/EMA50 on closed daily bars): +1 / -1 / 0
 
 
 def compute_signals(m15: pd.DataFrame, h1: pd.DataFrame, p: Params,
@@ -214,6 +221,11 @@ def compute_signals(m15: pd.DataFrame, h1: pd.DataFrame, p: Params,
     ema_s = h1c.ewm(span=p.ema_slow, adjust=False).mean().to_numpy()
     h1_close_time = (h1.index + pd.Timedelta(hours=1)).to_numpy()
     h1_close = h1c.to_numpy()
+    d1 = h1.resample("1D").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+    d1_f = d1["close"].ewm(span=20, adjust=False).mean().to_numpy()
+    d1_s = d1["close"].ewm(span=50, adjust=False).mean().to_numpy()
+    d1_c = d1["close"].to_numpy()
+    d1_close_time = (d1.index + pd.Timedelta(days=1)).to_numpy()
 
     rows: list[SignalRow] = []
     first_i = 0
@@ -256,6 +268,13 @@ def compute_signals(m15: pd.DataFrame, h1: pd.DataFrame, p: Params,
             elif h_last < h_prev and l_last < l_prev:
                 struct = -1
         trend = 0 if htf * struct < 0 else (struct if struct != 0 else htf)
+        kd = int(np.searchsorted(d1_close_time, np.datetime64(eval_time), side="right")) - 1
+        d1_trend = 0
+        if kd >= 0:
+            if d1_c[kd] > d1_f[kd] > d1_s[kd]:
+                d1_trend = 1
+            elif d1_c[kd] < d1_f[kd] < d1_s[kd]:
+                d1_trend = -1
 
         o1, h1_, l1, c1 = O[i], H[i], L[i], C[i]
         side = 0
@@ -264,7 +283,7 @@ def compute_signals(m15: pd.DataFrame, h1: pd.DataFrame, p: Params,
         elif trend < 0 and c1 < o1:
             side = -1
         if side == 0:
-            rows.append(SignalRow(eval_time, 0, False, False, False, False, False, atr_ratio))
+            rows.append(SignalRow(eval_time, 0, False, False, False, False, False, atr_ratio, d1_trend))
             continue
 
         # S/R levels
@@ -389,12 +408,14 @@ def compute_signals(m15: pd.DataFrame, h1: pd.DataFrame, p: Params,
                 f_fvg = True
                 break
 
-        rows.append(SignalRow(eval_time, side, bool(f_level), f_zone, f_tl, f_sweep, f_fvg, atr_ratio))
+        rows.append(SignalRow(eval_time, side, bool(f_level), f_zone, f_tl, f_sweep, f_fvg, atr_ratio, d1_trend))
     return rows
 
 
 def confluence(r: SignalRow, p: Params) -> int:
-    return (int(r.level) + int(r.zone) + int(r.tl)
+    if p.require_fvg and not r.fvg:
+        return 0
+    return (int(r.level) + int(r.zone) + (int(r.tl) if p.use_tl else 0)
             + (int(r.sweep) if p.use_sweep else 0) + (int(r.fvg) if p.use_fvg else 0))
 
 
@@ -512,7 +533,7 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
             while basket is not None:
                 stop_lvl = basket.bid_for_money(-p.max_basket_loss_usd, p.spread)
                 add_lvl = None
-                if len(basket.entries) < p.max_trades:
+                if len(basket.entries) < p.max_trades and not p.add_on_bar_close:
                     add_lvl = basket.bid_for_last(-step_money(basket.entries[-1][1], now), p.spread)
                 if basket.side > 0:
                     stop_hit = p1 <= stop_lvl
@@ -559,8 +580,16 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
             return "friday"
         if p.max_atr_ratio > 0 and sig.atr_ratio > p.max_atr_ratio:
             return "volatility"
+        if p.min_atr_ratio > 0 and sig.atr_ratio < p.min_atr_ratio:
+            return "quiet"
+        if p.use_d1_filter and sig.d1 == -sig.side:
+            return "d1"
         if p.max_daily_loss_usd > 0 and day_pl.get(now.normalize(), 0.0) <= -p.max_daily_loss_usd:
             return "daily"
+        if p.max_weekly_loss_usd > 0:
+            wk = (now - pd.Timedelta(days=now.weekday())).normalize()
+            if sum(v for d, v in day_pl.items() if d >= wk) <= -p.max_weekly_loss_usd:
+                return "weekly"
         if p.spread > p.max_spread:
             return "spread"
         return ""
@@ -575,6 +604,11 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
         bar15 = now.floor("15min")
         if bar15 != last_bar15:
             last_bar15 = bar15
+            # recovery on bar close: the previous M15 bar just closed at ~this open
+            if (p.add_on_bar_close and basket is not None and len(basket.entries) < p.max_trades
+                    and basket.last_pnl(o, p.spread) <= -step_money(basket.entries[-1][1], now)):
+                entry = o + p.spread if basket.side > 0 else o
+                basket.entries.append((entry, p.lots))
             sig = sig_by_time.get(bar15)
             if sig is not None and sig.side != 0 and confluence(sig, p) >= max(1, p.min_confluence):
                 reason = blocked(now, sig)
@@ -640,7 +674,7 @@ def summary(res: Result) -> dict:
 
 
 SCENARIOS: dict[str, dict] = {
-    "A  base v4.2": {},
+    "A  base v4.3": {},
     "B  no direction cooldown": {"direction_cooldown_h": 0},
     "C  no weekend close": {"close_before_weekend": False},
     "D  ATR step, 4 trades": {"step_mode_atr": True, "max_trades": 4},
@@ -678,7 +712,7 @@ def main(argv: list[str] | None = None) -> int:
     signals = compute_signals(m15, h1, base, start)
     m15_atr = pd.Series(mt4_atr(m15, base.atr_period), index=m15.index)
 
-    runs = SCENARIOS if args.scenarios else {"A  base v4.2": {}}
+    runs = SCENARIOS if args.scenarios else {"A  base v4.3": {}}
     rows = []
     for name, over in runs.items():
         p = replace(base, **over)
