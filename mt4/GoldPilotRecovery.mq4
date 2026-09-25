@@ -13,6 +13,12 @@
 #property version   "4.00"
 #property description "GoldPilot Recovery v4 - S/R, trendlines, supply/demand signals + basket recovery manager"
 
+enum ENUM_OPPOSITE_ACTION
+{
+   OPPOSITE_CLOSE = 0,   // Close it (one direction only)
+   OPPOSITE_ALERT = 1    // Alert only, manage as a separate basket
+};
+
 //==================================================================
 //                    MONEY POLICY (BASKET)
 //==================================================================
@@ -20,12 +26,12 @@ input string   s_money               = "=== Money policy (basket) ===";
 input double   TakeProfitUSD         = 10.0;   // Min profit to close a single trade / basket
 input double   StepLossUSD           = 10.0;   // Open next trade when the LAST trade is at -this
 input double   RecoveryRatio         = 0.3333; // Basket target = ratio x worst basket drawdown
-input int      MaxTrades             = 5;      // Max trades per basket (safety limit)
-input double   MaxBasketLossUSD      = 200.0;  // Emergency stop: close basket at -this (required)
+input int      MaxTrades             = 4;      // Max trades per basket (safety limit)
+input double   MaxBasketLossUSD      = 100.0;  // Emergency stop: close basket at -this (required)
 input double   RecoveryLotMultiplier = 1.0;    // 1.0 = same lot. >1 is martingale (dangerous)
 input bool     AutoOpenRecovery      = true;   // true = EA opens recovery trades, false = alert only
 input bool     SetBrokerTPSL         = true;   // Write basket TP / emergency SL on server orders
-input int      ModifyThresholdPoints = 50;     // Min TP/SL change (points) before re-sending
+input double   ModifyThresholdPrice  = 0.50;   // Min TP/SL change (in price, e.g. 0.50 = 50 cents) before re-sending
 input int      ModifyMinSeconds      = 10;     // Min seconds between TP/SL updates
 input int      PauseAfterStopMinutes = 60;     // No auto entries after an emergency stop
 
@@ -36,9 +42,11 @@ input string   s_orders              = "=== Orders ===";
 input int      MagicNumber           = 26091101;
 input bool     ManageManualTrades    = true;   // Manage trades you open by hand (magic 0)
 input double   DefaultLots           = 0.01;   // Lot for BUY/SELL buttons and auto signals
+input double   MaxLotPerTrade        = 0.02;   // No EA order is ever bigger than this
+input ENUM_OPPOSITE_ACTION OppositeTradeAction = OPPOSITE_CLOSE; // Trade opposite to the open basket
 input bool     ConfirmButtons        = true;   // Ask before BUY / SELL / CLOSE ALL
-input int      MaxSpreadPoints       = 80;
-input int      Slippage              = 30;
+input double   MaxSpreadPrice        = 0.80;   // Max spread in price (0.80 = 80 cents on gold)
+input double   SlippagePrice         = 0.50;   // Max slippage in price
 input int      MaxRetries            = 3;
 
 //==================================================================
@@ -48,7 +56,7 @@ input string   s_signal              = "=== Entry signal ===";
 input ENUM_TIMEFRAMES SignalTF       = PERIOD_M15; // Entry timeframe (M5 or M15)
 input ENUM_TIMEFRAMES TrendTF        = PERIOD_H1;  // Higher timeframe trend filter
 input int      MinConfluence         = 1;      // Min reasons: level / zone / trendline (1-3)
-input bool     AutoTradeSignals      = false;  // Open first trade on signal (use in Strategy Tester)
+input bool     AutoTradeSignals      = true;   // Open first trade on signal automatically
 input bool     UseSessionFilter      = false;  // Auto entries only inside session (server time)
 input int      SessionStartHour      = 7;
 input int      SessionEndHour        = 22;
@@ -170,6 +178,7 @@ int      gAlertedTicket[2];
 bool     gMaxAlerted[2];
 datetime gLastOpenTry[2];
 datetime gPauseUntil = 0;
+bool     gOppAlerted = false;
 
 //==================================================================
 //                            UTILITY
@@ -213,9 +222,14 @@ double NormalizeLots(double lots)
    return(NormalizeDouble(lots, d));
 }
 
+int SlippagePoints()
+{
+   return((int)MathMax(1, MathRound(SlippagePrice / Point)));
+}
+
 bool SpreadOK()
 {
-   return((Ask - Bid) / Point <= MaxSpreadPoints);
+   return(Ask - Bid <= MaxSpreadPrice + Point * 0.5);
 }
 
 bool InSession()
@@ -282,10 +296,11 @@ double Target(int idx)
 int OnInit()
 {
    if(TakeProfitUSD <= 0 || StepLossUSD <= 0 || MaxBasketLossUSD <= 0 || MaxTrades < 1 ||
-      RecoveryRatio <= 0 || RecoveryRatio > 1 || RecoveryLotMultiplier <= 0 || DefaultLots <= 0)
+      RecoveryRatio <= 0 || RecoveryRatio > 1 || RecoveryLotMultiplier <= 0 || DefaultLots <= 0 ||
+      MaxLotPerTrade < DefaultLots)
    {
       Alert("GoldPilot Recovery: invalid money settings. TakeProfitUSD, StepLossUSD, ",
-            "MaxBasketLossUSD, MaxTrades, lots must be > 0 and RecoveryRatio in (0,1].");
+            "MaxBasketLossUSD, MaxTrades, lots must be > 0, RecoveryRatio in (0,1], MaxLotPerTrade >= DefaultLots.");
       return(INIT_PARAMETERS_INCORRECT);
    }
 
@@ -345,6 +360,7 @@ void OnTick()
       if(AutoTradeSignals) TryAutoEntry();
    }
 
+   EnforceOneDirection();
    ManageBasket(OP_BUY);
    ManageBasket(OP_SELL);
 
@@ -779,6 +795,55 @@ void TryAutoEntry()
 //==================================================================
 //                         BASKET MANAGER
 //==================================================================
+bool HasTrades(int type)
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      if(OrderType() == type && IsManaged()) return(true);
+   }
+   return(false);
+}
+
+// One direction only: the first open trade decides the direction.
+// A trade in the other direction is closed (or only reported).
+void EnforceOneDirection()
+{
+   int      firstType = -1, firstTicket = 0;
+   datetime firstTime = 0;
+   bool     hasBuy = false, hasSell = false;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES)) continue;
+      int type = OrderType();
+      if((type != OP_BUY && type != OP_SELL) || !IsManaged()) continue;
+      if(type == OP_BUY) hasBuy = true; else hasSell = true;
+      if(firstType < 0 || OrderOpenTime() < firstTime ||
+         (OrderOpenTime() == firstTime && OrderTicket() < firstTicket))
+      {
+         firstType = type;
+         firstTime = OrderOpenTime();
+         firstTicket = OrderTicket();
+      }
+   }
+
+   if(!(hasBuy && hasSell)) { gOppAlerted = false; return; }
+
+   int opposite = (firstType == OP_BUY) ? OP_SELL : OP_BUY;
+   if(OppositeTradeAction == OPPOSITE_CLOSE)
+   {
+      int n = CloseBasket(opposite);
+      Notify(StringFormat("%s: one direction only (%s basket open) - closed %d %s trade(s)",
+                          Symbol(), Side(firstType), n, Side(opposite)));
+   }
+   else if(!gOppAlerted)
+   {
+      gOppAlerted = true;
+      Notify(StringFormat("%s: both BUY and SELL baskets are open", Symbol()));
+   }
+}
+
 void ScanBasket(int type, BasketInfo &b)
 {
    b.count = 0; b.lots = 0; b.sumLotsOpen = 0; b.fees = 0; b.profit = 0;
@@ -874,7 +939,7 @@ void ManageBasket(int type)
             if(SpreadOK() && TimeCurrent() - gLastOpenTry[idx] >= 5)
             {
                gLastOpenTry[idx] = TimeCurrent();
-               double lots = NormalizeLots(b.lastLots * RecoveryLotMultiplier);
+               double lots = NormalizeLots(MathMin(b.lastLots * RecoveryLotMultiplier, MaxLotPerTrade));
                if(OpenMarket(type, lots, StringFormat("GPR rec %d", b.count + 1)))
                {
                   Notify(StringFormat("%s recovery %s #%d opened (%.2f lot). Basket P/L %.2f",
@@ -916,7 +981,7 @@ void SyncTPSL(int type, BasketInfo &b, double target)
    RefreshRates();
    double minDist = (MathMax(MarketInfo(Symbol(), MODE_STOPLEVEL),
                              MarketInfo(Symbol(), MODE_FREEZELEVEL)) + 2) * Point;
-   double thr = MathMax(ModifyThresholdPoints * Point, Point * 0.5);
+   double thr = MathMax(ModifyThresholdPrice, Point * 0.5);
    bool changed = false;
 
    for(int i = OrdersTotal() - 1; i >= 0; i--)
@@ -960,7 +1025,7 @@ bool OpenMarket(int type, double lots, string comment)
       Print("Trading not allowed (enable AutoTrading).");
       return(false);
    }
-   lots = NormalizeLots(lots);
+   lots = NormalizeLots(MathMin(lots, MaxLotPerTrade));
 
    ResetLastError();
    if(AccountFreeMarginCheck(Symbol(), type, lots) <= 0 || GetLastError() == ERR_NOT_ENOUGH_MONEY)
@@ -974,7 +1039,7 @@ bool OpenMarket(int type, double lots, string comment)
       RefreshRates();
       double price = (type == OP_BUY) ? Ask : Bid;
       ResetLastError();
-      int t = OrderSend(Symbol(), type, lots, NormalizeDouble(price, Digits), Slippage, 0, 0,
+      int t = OrderSend(Symbol(), type, lots, NormalizeDouble(price, Digits), SlippagePoints(), 0, 0,
                         comment, MagicNumber, 0, type == OP_BUY ? clrLime : clrRed);
       if(t > 0) return(true);
       int err = GetLastError();
@@ -1011,7 +1076,7 @@ bool CloseOrder(int ticket)
       double price = (OrderType() == OP_BUY) ? MarketInfo(OrderSymbol(), MODE_BID)
                                               : MarketInfo(OrderSymbol(), MODE_ASK);
       ResetLastError();
-      if(OrderClose(ticket, OrderLots(), NormalizeDouble(price, Digits), Slippage, clrNONE))
+      if(OrderClose(ticket, OrderLots(), NormalizeDouble(price, Digits), SlippagePoints(), clrNONE))
          return(true);
       int err = GetLastError();
       Print("OrderClose #", ticket, " failed, error ", err);
@@ -1072,7 +1137,12 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
    if(id != CHARTEVENT_OBJECT_CLICK) return;
    if(sparam != BTN_BUY && sparam != BTN_SELL && sparam != BTN_CLOSE) return;
 
-   if(sparam == BTN_BUY)
+   if(sparam != BTN_CLOSE && OppositeTradeAction == OPPOSITE_CLOSE &&
+      HasTrades(sparam == BTN_BUY ? OP_SELL : OP_BUY))
+   {
+      Notify("One direction only: close the open basket before trading the other way.");
+   }
+   else if(sparam == BTN_BUY)
    {
       if(Confirm(StringFormat("BUY %.2f lot %s ?", DefaultLots, Symbol())))
          OpenMarket(OP_BUY, DefaultLots, "GPR button");
@@ -1262,7 +1332,7 @@ void UpdateDashboard()
    Row(y, "trend2", StringFormat(" %s EMA: %s | %s swings: %s", TFName(TrendTF), TrendName(gHTF),
                                  tf, gStruct > 0 ? "HH/HL" : gStruct < 0 ? "LH/LL" : "mixed"),
        clrSilver);
-   Row(y, "atr", StringFormat("ATR %.2f | Spread %d pt", gATR, (int)MathRound((Ask - Bid) / Point)),
+   Row(y, "atr", StringFormat("ATR %.2f | Spread %.2f", gATR, Ask - Bid),
        SpreadOK() ? clrSilver : clrOrange);
 
    int si = NearestLevel(Bid, true), ri = NearestLevel(Bid, false);
