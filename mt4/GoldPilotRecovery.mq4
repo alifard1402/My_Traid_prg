@@ -10,10 +10,18 @@
 //|     - Basket manager: +$ take profit, recovery trades every -$,  |
 //|       basket target = ratio x worst drawdown, emergency stop     |
 //|     - Basket journal (CSV) and win/loss statistics               |
+//|     - v4.2: per-direction cooldown after a stop, weekend close,  |
+//|       optional ATR-based recovery step                           |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.10"
-#property description "GoldPilot Recovery v4.1 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
+#property version   "4.20"
+#property description "GoldPilot Recovery v4.2 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
+
+enum ENUM_STEP_MODE
+{
+   STEP_FIXED = 0,   // Fixed: StepLossUSD
+   STEP_ATR   = 1    // Adaptive: max(StepLossUSD, ATR x StepATRMult)
+};
 
 enum ENUM_OPPOSITE_ACTION
 {
@@ -27,14 +35,17 @@ enum ENUM_OPPOSITE_ACTION
 input string   s_money               = "=== Money policy (basket) ===";
 input double   TakeProfitUSD         = 10.0;   // Min profit to close a single trade / basket
 input double   StepLossUSD           = 10.0;   // Open next trade when the LAST trade is at -this
+input ENUM_STEP_MODE StepMode         = STEP_FIXED; // Recovery step: fixed $ or adapted to volatility
+input double   StepATRMult           = 1.5;    // STEP_ATR: step = this x ATR price move (never below StepLossUSD)
+input ENUM_TIMEFRAMES StepATRTF      = PERIOD_M15; // STEP_ATR: ATR timeframe
 input double   RecoveryRatio         = 0.3333; // Basket target = ratio x worst basket drawdown
 input int      MaxTrades             = 5;      // Max trades per basket (safety limit)
 input double   MaxBasketLossUSD      = 150.0;  // Emergency stop: close basket at -this (required)
 input double   RecoveryLotMultiplier = 1.0;    // 1.0 = same lot. >1 is martingale (dangerous)
 input bool     AutoOpenRecovery      = true;   // true = EA opens recovery trades, false = alert only
 input bool     SetBrokerTPSL         = true;   // Write basket TP / emergency SL on server orders
-input double   ModifyThresholdPrice  = 0.50;   // Min TP/SL change (in price, e.g. 0.50 = 50 cents) before re-sending
-input int      ModifyMinSeconds      = 10;     // Min seconds between TP/SL updates
+input double   ModifyThresholdPrice  = 1.00;   // Min TP/SL change (in price, e.g. 1.00 = 1 dollar) before re-sending
+input int      ModifyMinSeconds      = 30;     // Min seconds between TP/SL updates
 input int      PauseAfterStopMinutes = 60;     // No auto entries after an emergency stop
 
 //==================================================================
@@ -76,7 +87,11 @@ input string   s_filters             = "=== New-basket risk filters ===";
 input double   MaxATRRatio           = 2.0;    // Skip if ATR(14) > this x ATR(100) (news spikes). 0 = off
 input double   MaxDailyLossUSD       = 150.0;  // No new basket today after this closed loss. 0 = off
 input bool     UseFridayCutoff       = true;   // Weekend gap protection
-input int      FridayCutoffHour      = 20;     // No new basket on Friday from this server hour
+input int      FridayCutoffHour      = 16;     // No new basket on Friday from this server hour
+input int      DirectionCooldownHours = 24;    // After an emergency stop, no new basket in THAT direction. 0 = off
+input bool     CloseBeforeWeekend    = true;   // Friday: close the basket if it is not deep in loss
+input int      WeekendCloseHour      = 21;     // Friday server hour for the weekend close
+input double   WeekendCloseMaxLossUSD = 20.0;  // Close only if basket P/L >= -this (deeper: keep + alert)
 input bool     WriteJournal          = true;   // Log every basket to MQL4/Files/GoldPilot_baskets.csv
 
 //==================================================================
@@ -215,6 +230,8 @@ bool     gOppAlerted = false;
 datetime gNews[];
 
 datetime gBasketStart[2];
+datetime gDirBlockUntil[2];
+bool     gWeekendAlerted[2];
 string   gCloseReason[2];
 int      gWins = 0, gLosses = 0, gStops = 0;
 double   gNet = 0, gWorstEver = 0;
@@ -359,6 +376,37 @@ void SaveWorst(int idx)
    else GlobalVariableSet(n, gWorst[idx]);
 }
 
+string BlockName(int idx)
+{
+   return(StringFormat("GPR_%s_%d_%s_block", Symbol(), MagicNumber, idx == 0 ? "buy" : "sell"));
+}
+
+void SaveDirBlock(int idx)
+{
+   GlobalVariableSet(BlockName(idx), (double)gDirBlockUntil[idx]);
+}
+
+datetime LoadDirBlock(int idx)
+{
+   string n = BlockName(idx);
+   if(GlobalVariableCheck(n)) return((datetime)GlobalVariableGet(n));
+   return(0);
+}
+
+// Money loss of the LAST trade that triggers the next recovery trade.
+double StepMoney(double lots)
+{
+   if(StepMode == STEP_FIXED || lots <= 0) return(StepLossUSD);
+   double atr = iATR(NULL, StepATRTF, ATRPeriod, 1);
+   return(MathMax(StepLossUSD, StepATRMult * atr * ValuePerPrice() * lots));
+}
+
+bool IsWeekendCloseTime()
+{
+   return(CloseBeforeWeekend && TimeDayOfWeek(TimeCurrent()) == 5 &&
+          TimeHour(TimeCurrent()) >= WeekendCloseHour);
+}
+
 double Target(int idx)
 {
    return(MathMax(TakeProfitUSD, RecoveryRatio * (-gWorst[idx])));
@@ -379,7 +427,7 @@ int OnInit()
    }
 
    double lossAtLastAdd = StepLossUSD * MaxTrades * (MaxTrades - 1) / 2.0;
-   if(MaxBasketLossUSD <= lossAtLastAdd)
+   if(StepMode == STEP_FIXED && MaxBasketLossUSD <= lossAtLastAdd)
       Print("WARNING: MaxBasketLossUSD (", DoubleToString(MaxBasketLossUSD, 2),
             ") is reached before trade #", MaxTrades, " can open (basket is already at -",
             DoubleToString(lossAtLastAdd, 2), " then).");
@@ -398,6 +446,8 @@ int OnInit()
       gLastOpenTry[i]     = 0;
       gBasketStart[i]     = 0;
       gCloseReason[i]     = "";
+      gDirBlockUntil[i]   = IsTesting() ? 0 : LoadDirBlock(i);
+      gWeekendAlerted[i]  = false;
    }
    if(IsTesting() && WriteJournal) FileDelete(JOURNAL);   // fresh journal per test run
 
@@ -411,7 +461,7 @@ int OnInit()
    gLastBar = iTime(NULL, SignalTF, 1);
    UpdateDashboard();
 
-   Print("GoldPilot Recovery v4.1 started on ", Symbol(), " ", TFName(SignalTF),
+   Print("GoldPilot Recovery v4.2 started on ", Symbol(), " ", TFName(SignalTF),
          " | $1 price move per 1 lot = ", DoubleToString(ValuePerPrice(), 2));
    return(INIT_SUCCEEDED);
 }
@@ -1001,12 +1051,20 @@ void TryAutoEntry()
       return;
    }
 
+   int type = (gSigSide > 0) ? OP_BUY : OP_SELL;
+   if(TimeCurrent() < gDirBlockUntil[Idx(type)])
+   {
+      Print("Signal skipped: ", Side(type), " cooldown after stop until ",
+            TimeToString(gDirBlockUntil[Idx(type)], TIME_DATE | TIME_MINUTES));
+      return;
+   }
+
    BasketInfo b, s;
    ScanBasket(OP_BUY, b);
    ScanBasket(OP_SELL, s);
    if(b.count > 0 || s.count > 0) return;   // one basket at a time
 
-   OpenMarket(gSigSide > 0 ? OP_BUY : OP_SELL, DefaultLots, "GPR signal");
+   OpenMarket(type, DefaultLots, "GPR signal");
 }
 
 //==================================================================
@@ -1107,7 +1165,7 @@ double NextAddPrice(int type, BasketInfo &b)
 {
    double vpp = ValuePerPrice();
    if(vpp <= 0 || b.lastLots <= 0) return(0);
-   return(b.lastOpen + Dir(type) * (-StepLossUSD - b.lastFees) / (vpp * b.lastLots));
+   return(b.lastOpen + Dir(type) * (-StepMoney(b.lastLots) - b.lastFees) / (vpp * b.lastLots));
 }
 
 void ManageBasket(int type)
@@ -1122,6 +1180,7 @@ void ManageBasket(int type)
       if(gWorst[idx] != 0) { gWorst[idx] = 0; SaveWorst(idx); }
       gAlertedTicket[idx]   = 0;
       gMaxAlerted[idx]      = false;
+      gWeekendAlerted[idx]  = false;
       gLastModifyCount[idx] = -1;
       return;
    }
@@ -1147,8 +1206,25 @@ void ManageBasket(int type)
       return;
    }
 
-   // 3) Recovery: last trade reached -StepLossUSD -> add a trade in the same direction.
-   if(b.lastProfit <= -StepLossUSD)
+   // 3) Weekend: close the basket before the Friday close unless it is deep in loss.
+   if(IsWeekendCloseTime())
+   {
+      if(b.profit >= -WeekendCloseMaxLossUSD)
+      {
+         gCloseReason[idx] = "weekend";
+         CloseBasket(type);
+         return;
+      }
+      if(!gWeekendAlerted[idx])
+      {
+         gWeekendAlerted[idx] = true;
+         Notify(StringFormat("%s %s basket at %.2f is held over the weekend (weekend close needs >= -%.2f)",
+                             Symbol(), Side(type), b.profit, WeekendCloseMaxLossUSD));
+      }
+   }
+
+   // 4) Recovery: last trade reached -step -> add a trade in the same direction.
+   if(b.lastProfit <= -StepMoney(b.lastLots))
    {
       if(b.count < MaxTrades)
       {
@@ -1181,7 +1257,7 @@ void ManageBasket(int type)
       }
    }
 
-   // 4) Keep TP / SL on the server in sync (protects the basket if MT4 disconnects).
+   // 5) Keep TP / SL on the server in sync (protects the basket if MT4 disconnects).
    if(SetBrokerTPSL) SyncTPSL(type, b, target);
 }
 
@@ -1220,6 +1296,11 @@ void FinishBasket(int type)
    {
       gStops++;
       gPauseUntil = TimeCurrent() + PauseAfterStopMinutes * 60;
+      if(DirectionCooldownHours > 0)
+      {
+         gDirBlockUntil[idx] = TimeCurrent() + DirectionCooldownHours * 3600;
+         SaveDirBlock(idx);
+      }
    }
    gNet += result;
    gWorstEver = MathMin(gWorstEver, worst);
@@ -1634,7 +1715,7 @@ void UpdateDashboard()
    int y = DashY;
    string tf = TFName(SignalTF);
 
-   Row(y, "title", "GoldPilot Recovery v4.1  " + Symbol() + " " + tf, clrGold);
+   Row(y, "title", "GoldPilot Recovery v4.2  " + Symbol() + " " + tf, clrGold);
 
    string trendTxt = (gTrend > 0) ? "BULLISH" : (gTrend < 0) ? "BEARISH" : "NEUTRAL - wait";
    Row(y, "trend", "Trend: " + trendTxt, TrendColor(gTrend));
@@ -1678,9 +1759,10 @@ void UpdateDashboard()
    Row(y, "sep2", "------------------------------------", clrDimGray);
 
    double vpp = ValuePerPrice();
-   double stepDist = (vpp > 0) ? StepLossUSD / (vpp * DefaultLots) : 0;
-   Row(y, "step", StringFormat("$%.0f = %.2f price move @ %.2f lot", StepLossUSD, stepDist, DefaultLots),
-       clrSilver);
+   double stepMoney = StepMoney(DefaultLots);
+   double stepDist = (vpp > 0) ? stepMoney / (vpp * DefaultLots) : 0;
+   Row(y, "step", StringFormat("Step $%.2f = %.2f price @ %.2f lot%s", stepMoney, stepDist, DefaultLots,
+                               StepMode == STEP_ATR ? " (ATR)" : ""), clrSilver);
    double bal = AccountBalance();
    double riskPct = (bal > 0) ? MaxBasketLossUSD / bal * 100 : 0;
    Row(y, "risk", StringFormat("Emergency stop = %.1f%% of balance", riskPct),
@@ -1692,6 +1774,10 @@ void UpdateDashboard()
        clrSilver);
    Row(y, "stats", StringFormat("Baskets %dW/%dL stops %d net %+.2f", gWins, gLosses, gStops, gNet),
        clrSilver);
+   string cool = "";
+   if(TimeCurrent() < gDirBlockUntil[0]) cool += "BUY " + TimeToString(gDirBlockUntil[0], TIME_DATE | TIME_MINUTES) + " ";
+   if(TimeCurrent() < gDirBlockUntil[1]) cool += "SELL " + TimeToString(gDirBlockUntil[1], TIME_DATE | TIME_MINUTES);
+   Row(y, "cool", cool == "" ? " " : "Cooldown: " + cool, clrOrange);
 
    ChartRedraw(0);
 }
