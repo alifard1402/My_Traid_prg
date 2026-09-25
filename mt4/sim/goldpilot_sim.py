@@ -68,6 +68,11 @@ class Params:
     deep_trades: int = 5                # >0: baskets with at least this many trades ...
     deep_target_usd: float = 10.0       # ... close at this profit instead of the 1/3 rule
     pessimistic_path: bool = False      # stress test: inside each M1 bar price first moves against the basket
+    random_path_seed: int = -1          # >=0: random low/high order inside each M1 bar (Monte Carlo)
+    cluster_stops: int = 0              # >0: after this many emergency stops ...
+    cluster_days: float = 5.0           # ... within this many days ...
+    cluster_pause_h: float = 72.0       # ... no new basket for this many hours
+    no_add_rollover: bool = False       # no recovery adds 23:30-01:30 server (daily reopen gap)
     use_session: bool = True
     session_start: int = 10
     session_end: int = 22
@@ -509,6 +514,8 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
         kk = np.searchsorted(closed, t_arr.to_numpy(), side="right") - 1
         slope_now = np.where(kk >= 0, sl[np.clip(kk, 0, None)], 0)
     cur_slope = 0
+    coin = (np.random.default_rng(p.random_path_seed).random(len(C)) < 0.5
+            if p.random_path_seed >= 0 else None)
 
     balance = balance0
     peak_eq = balance0
@@ -518,6 +525,7 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
     pause_until = pd.Timestamp.min
     dir_block = {1: pd.Timestamp.min, -1: pd.Timestamp.min}
     day_pl: dict = {}
+    stop_times: list = []
     records = []
     last_bar15 = None
     close_reason = ""
@@ -552,6 +560,11 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
                         "reason": reason})
         if reason == "stop":
             pause_until = now + pd.Timedelta(minutes=p.pause_after_stop_min)
+            if p.cluster_stops > 0:
+                stop_times.append(now)
+                recent = [t for t in stop_times if now - t <= pd.Timedelta(days=p.cluster_days)]
+                if len(recent) >= p.cluster_stops:
+                    pause_until = max(pause_until, now + pd.Timedelta(hours=p.cluster_pause_h))
             if p.direction_cooldown_h > 0:
                 dir_block[basket.side] = now + pd.Timedelta(hours=p.direction_cooldown_h)
         basket = None
@@ -583,7 +596,9 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
             while basket is not None:
                 stop_lvl = basket.bid_for_money(-p.max_basket_loss_usd, p.spread)
                 add_lvl = None
-                if (len(basket.entries) < p.max_trades and not p.add_on_bar_close
+                rollover = p.no_add_rollover and (
+                    (now.hour == 23 and now.minute >= 30) or now.hour == 0 or (now.hour == 1 and now.minute < 30))
+                if (len(basket.entries) < p.max_trades and not p.add_on_bar_close and not rollover
                         and not (p.no_add_against_trend and cur_slope == -basket.side)):
                     add_lvl = basket.bid_for_last(-step_money(basket.entries[-1][1], now), p.spread)
                 if basket.side > 0:
@@ -691,6 +706,8 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
         # 3) intrabar path
         if p.pessimistic_path and basket is not None:
             path = (o, l, h, c) if basket.side > 0 else (o, h, l, c)
+        elif coin is not None:
+            path = (o, l, h, c) if coin[k] else (o, h, l, c)
         else:
             path = (o, l, h, c) if c >= o else (o, h, l, c)
         for a, b in zip(path[:-1], path[1:]):
