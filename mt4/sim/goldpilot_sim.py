@@ -1,4 +1,4 @@
-"""GoldPilot Recovery v4.5 — Python simulator for fast what-if backtests.
+"""GoldPilot Recovery v4.6 — Python simulator for fast what-if backtests.
 
 The MT4 Strategy Tester is the reference. This simulator re-implements the
 EA's logic so many parameter sets can be compared in minutes:
@@ -62,6 +62,12 @@ class Params:
     trend_mode: str = "h4slope_only"
     h4_ema: int = 50
     h4_slope_bars: int = 3
+    # basket-management experiments
+    no_add_against_trend: bool = False  # skip recovery adds while the H4 slope points against the basket
+    trail_usd: float = 10.0             # >0: at the target, trail the basket profit by this many dollars
+    deep_trades: int = 5                # >0: baskets with at least this many trades ...
+    deep_target_usd: float = 10.0       # ... close at this profit instead of the 1/3 rule
+    pessimistic_path: bool = False      # stress test: inside each M1 bar price first moves against the basket
     use_session: bool = True
     session_start: int = 10
     session_end: int = 22
@@ -447,6 +453,7 @@ class Basket:
     start: pd.Timestamp
     entries: list = field(default_factory=list)  # (fill price, lots)
     worst: float = 0.0
+    floor: float | None = None                   # trailing profit floor (money)
 
     @property
     def lots(self) -> float:
@@ -493,6 +500,15 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
     t_arr = m1.index
     O, H, L, C = (m1[c].to_numpy() for c in ("open", "high", "low", "close"))
     sig_by_time = {r.time: r for r in signals}
+    slope_now = np.zeros(len(C), dtype=int)
+    if p.no_add_against_trend:
+        h4 = m1.resample("4h").agg({"close": "last"}).dropna()
+        ema = h4["close"].ewm(span=p.h4_ema, adjust=False).mean()
+        sl = np.sign(ema - ema.shift(p.h4_slope_bars)).fillna(0).to_numpy().astype(int)
+        closed = (h4.index + pd.Timedelta(hours=4)).to_numpy()
+        kk = np.searchsorted(closed, t_arr.to_numpy(), side="right") - 1
+        slope_now = np.where(kk >= 0, sl[np.clip(kk, 0, None)], 0)
+    cur_slope = 0
 
     balance = balance0
     peak_eq = balance0
@@ -541,6 +557,11 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
         basket = None
         equity_point(bid)
 
+    def target_of(b: Basket) -> float:
+        if p.deep_trades > 0 and len(b.entries) >= p.deep_trades:
+            return p.deep_target_usd
+        return max(p.take_profit_usd, p.recovery_ratio * -b.worst)
+
     def move(p0: float, p1: float, now: pd.Timestamp):
         """Walk the Bid from p0 to p1 and fire adds / stop / target at their levels."""
         nonlocal basket
@@ -548,11 +569,22 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
             return
         adverse = (p1 < p0) if basket.side > 0 else (p1 > p0)
         cur = p0
+        if basket.floor is not None:
+            # trailing: close when profit falls back to the floor, else raise the floor
+            lvl = basket.bid_for_money(basket.floor, p.spread)
+            if adverse and ((basket.side > 0 and p1 <= lvl) or (basket.side < 0 and p1 >= lvl)):
+                fill = min(lvl, cur) if basket.side > 0 else max(lvl, cur)
+                finish(fill, now, "target")
+                return
+            basket.floor = max(basket.floor, basket.pnl(p1, p.spread) - p.trail_usd)
+            equity_point(p1)
+            return
         if adverse:
             while basket is not None:
                 stop_lvl = basket.bid_for_money(-p.max_basket_loss_usd, p.spread)
                 add_lvl = None
-                if len(basket.entries) < p.max_trades and not p.add_on_bar_close:
+                if (len(basket.entries) < p.max_trades and not p.add_on_bar_close
+                        and not (p.no_add_against_trend and cur_slope == -basket.side)):
                     add_lvl = basket.bid_for_last(-step_money(basket.entries[-1][1], now), p.spread)
                 if basket.side > 0:
                     stop_hit = p1 <= stop_lvl
@@ -581,10 +613,14 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
             basket.worst = min(basket.worst, basket.pnl(p1, p.spread))
             equity_point(p1)
         else:
-            target = max(p.take_profit_usd, p.recovery_ratio * -basket.worst)
+            target = target_of(basket)
             lvl = basket.bid_for_money(target, p.spread)
             hit = p1 >= lvl if basket.side > 0 else p1 <= lvl
             if hit:
+                if p.trail_usd > 0:
+                    basket.floor = max(target, basket.pnl(p1, p.spread) - p.trail_usd)
+                    equity_point(p1)
+                    return
                 fill = max(lvl, cur) if basket.side > 0 else min(lvl, cur)
                 finish(fill, now, "target")
                 return
@@ -618,6 +654,7 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
     for k in range(len(C)):
         now = t_arr[k]
         o, h, l, c = O[k], H[k], L[k], C[k]
+        cur_slope = slope_now[k]
 
         # 1) new M15 bar -> signal / auto entry (first tick of the bar)
         bar15 = now.floor("15min")
@@ -652,7 +689,10 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
             finish(o, now, "weekend")
 
         # 3) intrabar path
-        path = (o, l, h, c) if c >= o else (o, h, l, c)
+        if p.pessimistic_path and basket is not None:
+            path = (o, l, h, c) if basket.side > 0 else (o, h, l, c)
+        else:
+            path = (o, l, h, c) if c >= o else (o, h, l, c)
         for a, b in zip(path[:-1], path[1:]):
             if basket is None:
                 break
@@ -693,7 +733,7 @@ def summary(res: Result) -> dict:
 
 
 SCENARIOS: dict[str, dict] = {
-    "A  base v4.5": {},
+    "A  base v4.6": {},
     "B  no direction cooldown": {"direction_cooldown_h": 0},
     "C  no weekend close": {"close_before_weekend": False},
     "D  ATR step, 4 trades": {"step_mode_atr": True, "max_trades": 4},
@@ -731,7 +771,7 @@ def main(argv: list[str] | None = None) -> int:
     signals = compute_signals(m15, h1, base, start)
     m15_atr = pd.Series(mt4_atr(m15, base.atr_period), index=m15.index)
 
-    runs = SCENARIOS if args.scenarios else {"A  base v4.5": {}}
+    runs = SCENARIOS if args.scenarios else {"A  base v4.6": {}}
     rows = []
     for name, over in runs.items():
         p = replace(base, **over)

@@ -18,10 +18,12 @@
 //|       Strategy Tester only needs M1 + chart-timeframe history    |
 //|     - v4.5: direction from the slope of the H4 EMA50 (the H1     |
 //|       EMA50/200 + M15 structure reacted late to reversals)       |
+//|     - v4.6: profit trailing at the target (server SL follows the |
+//|       locked profit) and +10 target for 5-trade baskets          |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.50"
-#property description "GoldPilot Recovery v4.5 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
+#property version   "4.60"
+#property description "GoldPilot Recovery v4.6 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
 
 enum ENUM_TREND_MODE
 {
@@ -51,6 +53,9 @@ input ENUM_STEP_MODE StepMode         = STEP_FIXED; // Recovery step: fixed $ or
 input double   StepATRMult           = 1.5;    // STEP_ATR: step = this x ATR price move (never below StepLossUSD)
 input ENUM_TIMEFRAMES StepATRTF      = PERIOD_M15; // STEP_ATR: ATR timeframe
 input double   RecoveryRatio         = 0.3333; // Basket target = ratio x worst basket drawdown
+input double   TrailProfitUSD        = 10.0;   // At the target, trail the basket profit by this (0 = close at target)
+input int      DeepTrades            = 5;      // Baskets with this many trades use DeepTargetUSD (0 = off)
+input double   DeepTargetUSD         = 10.0;   // Target of deep baskets instead of the 1/3 rule
 input int      MaxTrades             = 5;      // Max trades per basket (safety limit)
 input double   MaxBasketLossUSD      = 150.0;  // Emergency stop: close basket at -this (required)
 input double   RecoveryLotMultiplier = 1.0;    // 1.0 = same lot. >1 is martingale (dangerous)
@@ -266,6 +271,8 @@ datetime gNews[];
 datetime gBasketStart[2];
 datetime gDirBlockUntil[2];
 bool     gWeekendAlerted[2];
+bool     gTrailOn[2];
+double   gTrailFloor[2];
 string   gCloseReason[2];
 int      gWins = 0, gLosses = 0, gStops = 0;
 double   gNet = 0, gWorstEver = 0;
@@ -441,8 +448,9 @@ bool IsWeekendCloseTime()
           TimeHour(TimeCurrent()) >= WeekendCloseHour);
 }
 
-double Target(int idx)
+double Target(int idx, int count)
 {
+   if(DeepTrades > 0 && count >= DeepTrades) return(DeepTargetUSD);
    return(MathMax(TakeProfitUSD, RecoveryRatio * (-gWorst[idx])));
 }
 
@@ -453,6 +461,7 @@ int OnInit()
 {
    if(TakeProfitUSD <= 0 || StepLossUSD <= 0 || MaxBasketLossUSD <= 0 || MaxTrades < 1 ||
       RecoveryRatio <= 0 || RecoveryRatio > 1 || RecoveryLotMultiplier <= 0 || DefaultLots <= 0 ||
+      TrailProfitUSD < 0 || DeepTargetUSD < 0 ||
       MaxLotPerTrade < DefaultLots)
    {
       Alert("GoldPilot Recovery: invalid money settings. TakeProfitUSD, StepLossUSD, ",
@@ -482,6 +491,8 @@ int OnInit()
       gCloseReason[i]     = "";
       gDirBlockUntil[i]   = IsTesting() ? 0 : LoadDirBlock(i);
       gWeekendAlerted[i]  = false;
+      gTrailOn[i]         = false;
+      gTrailFloor[i]      = 0;
    }
    if(IsTesting() && WriteJournal) FileDelete(JOURNAL);   // fresh journal per test run
 
@@ -496,7 +507,7 @@ int OnInit()
    UpdateDashboard();
 
    DataCheck();
-   Print("GoldPilot Recovery v4.5 started on ", Symbol(), " ", TFName(SignalTF),
+   Print("GoldPilot Recovery v4.6 started on ", Symbol(), " ", TFName(SignalTF),
          " | $1 price move per 1 lot = ", DoubleToString(ValuePerPrice(), 2));
    return(INIT_SUCCEEDED);
 }
@@ -1495,17 +1506,41 @@ void ManageBasket(int type)
       gAlertedTicket[idx]   = 0;
       gMaxAlerted[idx]      = false;
       gWeekendAlerted[idx]  = false;
+      gTrailOn[idx]         = false;
+      gTrailFloor[idx]      = 0;
       gLastModifyCount[idx] = -1;
       return;
    }
 
    if(gBasketStart[idx] == 0) { gBasketStart[idx] = b.firstTime; gCloseReason[idx] = ""; }
    if(b.profit < gWorst[idx]) { gWorst[idx] = b.profit; SaveWorst(idx); }
-   double target = Target(idx);
+   double target = Target(idx, b.count);
 
-   // 1) Target reached -> close the whole basket (result is reported by FinishBasket).
+   // 1) Target reached -> trail the profit (TrailProfitUSD) or close the whole basket.
+   //    Results are reported by FinishBasket.
+   if(gTrailOn[idx])
+   {
+      if(b.profit <= gTrailFloor[idx] || IsWeekendCloseTime())
+      {
+         gCloseReason[idx] = IsWeekendCloseTime() ? "weekend" : "target";
+         CloseBasket(type);
+         return;
+      }
+      gTrailFloor[idx] = MathMax(gTrailFloor[idx], b.profit - TrailProfitUSD);
+      if(SetBrokerTPSL) SyncTPSL(type, b, target);
+      return;
+   }
    if(b.profit >= target)
    {
+      if(TrailProfitUSD > 0)
+      {
+         gTrailOn[idx] = true;
+         gTrailFloor[idx] = MathMax(target, b.profit - TrailProfitUSD);
+         Print(StringFormat("%s %s basket at %+.2f: trailing, profit floor %+.2f",
+                            Symbol(), Side(type), b.profit, gTrailFloor[idx]));
+         if(SetBrokerTPSL) SyncTPSL(type, b, target);
+         return;
+      }
       gCloseReason[idx] = "target";
       CloseBasket(type);
       return;
@@ -1653,9 +1688,12 @@ void SyncTPSL(int type, BasketInfo &b, double target)
    if(b.count == gLastModifyCount[idx] && TimeCurrent() - gLastModify[idx] < ModifyMinSeconds)
       return;
 
-   double tp = NormalizeDouble(PriceForMoney(type, b, target), Digits);
-   double sl = NormalizeDouble(PriceForMoney(type, b, -MaxBasketLossUSD), Digits);
-   if(tp <= 0) return;
+   // With trailing the target is handled by the EA (no server TP). Once trailing,
+   // the server SL sits at the locked profit, otherwise at the emergency stop.
+   bool trailing = (TrailProfitUSD > 0);
+   double tp = trailing ? 0 : NormalizeDouble(PriceForMoney(type, b, target), Digits);
+   double sl = NormalizeDouble(PriceForMoney(type, b, gTrailOn[idx] ? gTrailFloor[idx] : -MaxBasketLossUSD), Digits);
+   if(!trailing && tp <= 0) return;
    if(sl < 0) sl = 0;
 
    RefreshRates();
@@ -1673,12 +1711,12 @@ void SyncTPSL(int type, BasketInfo &b, double target)
       double newTP = tp, newSL = sl;
       if(type == OP_BUY)
       {
-         if(newTP - Bid < minDist) newTP = curTP;                 // too close: software will close
+         if(newTP > 0 && newTP - Bid < minDist) newTP = curTP;    // too close: software will close
          if(newSL > 0 && Bid - newSL < minDist) newSL = curSL;
       }
       else
       {
-         if(Ask - newTP < minDist) newTP = curTP;
+         if(newTP > 0 && Ask - newTP < minDist) newTP = curTP;
          if(newSL > 0 && newSL - Ask < minDist) newSL = curSL;
       }
 
@@ -2010,14 +2048,19 @@ void BasketRows(int &y, int type)
    }
 
    double worst = MathMin(gWorst[idx], b.profit);
-   double target = MathMax(TakeProfitUSD, RecoveryRatio * (-worst));
+   double target = (DeepTrades > 0 && b.count >= DeepTrades) ? DeepTargetUSD
+                                                             : MathMax(TakeProfitUSD, RecoveryRatio * (-worst));
    color c = (b.profit >= 0) ? clrLime : clrOrange;
    Row(y, k + "1", StringFormat("%s x%d %.2f lot  P/L %+.2f  worst %.2f",
                                 Side(type), b.count, b.lots, b.profit, worst), c);
 
    string add = (b.count < MaxTrades) ? Px(NextAddPrice(type, b)) : "max";
-   Row(y, k + "2", StringFormat("  TP %+.2f @%s  next add @%s",
-                                target, Px(PriceForMoney(type, b, target)), add), clrSilver);
+   if(gTrailOn[idx])
+      Row(y, k + "2", StringFormat("  TRAILING floor %+.2f @%s", gTrailFloor[idx],
+                                   Px(PriceForMoney(type, b, gTrailFloor[idx]))), clrLime);
+   else
+      Row(y, k + "2", StringFormat("  TP %+.2f @%s  next add @%s",
+                                   target, Px(PriceForMoney(type, b, target)), add), clrSilver);
    Row(y, k + "3", StringFormat("  STOP -%.2f @%s",
                                 MaxBasketLossUSD, Px(PriceForMoney(type, b, -MaxBasketLossUSD))),
        clrTomato);
@@ -2029,7 +2072,7 @@ void UpdateDashboard()
    int y = DashY;
    string tf = TFName(SignalTF);
 
-   Row(y, "title", "GoldPilot Recovery v4.5  " + Symbol() + " " + tf, clrGold);
+   Row(y, "title", "GoldPilot Recovery v4.6  " + Symbol() + " " + tf, clrGold);
 
    string trendTxt = (gTrend > 0) ? "BULLISH" : (gTrend < 0) ? "BEARISH" : "NEUTRAL - wait";
    Row(y, "trend", "Trend: " + trendTxt, TrendColor(gTrend));

@@ -5,6 +5,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+from dataclasses import replace
+
 import pandas as pd
 import pytest
 
@@ -24,7 +26,8 @@ def buy_signal_at(t: str) -> SignalRow:
     return SignalRow(pd.Timestamp(t), 1, True, True, False, False, False, 1.0)
 
 
-P = Params(spread=0.0, use_session=False, use_friday_cutoff=False, close_before_weekend=False)
+P = Params(spread=0.0, use_session=False, use_friday_cutoff=False, close_before_weekend=False,
+           min_atr_ratio=0.0, trail_usd=0.0, deep_trades=0)
 
 
 def test_price_levels_match_money():
@@ -63,3 +66,27 @@ def test_emergency_stop_caps_the_loss():
     assert row.reason == "stop"
     assert row.result == pytest.approx(-150.0)
     assert row.trades == 5
+
+
+def test_trailing_keeps_the_profit_running():
+    # +10 reached at 2010, price runs to 2030, falls back: floor = 30 - 10 = +20
+    m1 = bars([2000.0, 2010.0, 2020.0, 2030.0, 2025.0, 2015.0, 2000.0])
+    res = simulate(m1, [buy_signal_at("2026-01-05 10:00")], replace(P, trail_usd=10.0))
+    row = res.baskets.iloc[0]
+    assert row.reason == "target"
+    assert row.result == pytest.approx(20.0)
+
+
+def test_trailing_never_closes_below_the_target():
+    m1 = bars([2000.0, 2010.0, 2012.0, 2000.0])
+    res = simulate(m1, [buy_signal_at("2026-01-05 10:00")], replace(P, trail_usd=10.0))
+    assert res.baskets.iloc[0].result == pytest.approx(10.0)
+
+
+def test_deep_basket_uses_deep_target():
+    # 5 trades (2000..1960), worst -100 at 1960: 1/3 rule would need +33; deep target is +10
+    m1 = bars([2000.0, 1990.0, 1980.0, 1970.0, 1960.0, 1985.0])
+    res = simulate(m1, [buy_signal_at("2026-01-05 10:00")], replace(P, deep_trades=5, deep_target_usd=10.0))
+    row = res.baskets.iloc[0]
+    assert row.trades == 5
+    assert row.result == pytest.approx(10.0)
