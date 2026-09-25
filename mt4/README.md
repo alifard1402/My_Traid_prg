@@ -10,6 +10,9 @@
 
 فایل: [`GoldPilotRecovery.mq4`](GoldPilotRecovery.mq4)
 
+**نتایج شبیه‌ساز روی ۲۰ ماه داده:** [`sim/RESULTS.md`](sim/RESULTS.md) — شبیه‌ساز پایتونی
+ربات در [`sim/goldpilot_sim.py`](sim/goldpilot_sim.py).
+
 برای بک‌تست روی ماه‌ها و سال‌های قبل: [`DATA_IMPORT.md`](DATA_IMPORT.md) (دانلود داده رایگان
 طلا و وارد کردنش به MT4 با اسکریپت [`HistDataToMT4.mq4`](HistDataToMT4.mq4)).
 

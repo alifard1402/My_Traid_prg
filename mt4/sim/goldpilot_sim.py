@@ -97,18 +97,24 @@ def _read_text(path: Path) -> list[tuple[str, str]]:
 
 
 def _parse(text: str) -> tuple[pd.DataFrame, str]:
-    """Returns M1 bars in the file's own time zone and that zone ('est' or 'utc')."""
+    """Returns M1 bars in the file's own time zone and that zone ('newyork' or 'utc').
+
+    HistData says "EST without daylight saving", but its gold files follow New
+    York local time: the daily 17:00-18:00 break is at the same clock time in
+    summer and winter, and matching LiteFinance fills from two MT4 reports
+    (Aug-Sep 2026) gives the best fit with New York time + 7 h.
+    """
     first = next(line for line in text.splitlines() if line.strip() and line[0].isdigit())
     if ";" in first:  # HistData ASCII: 20250102 180000;o;h;l;c;v
         df = pd.read_csv(io.StringIO(text), sep=";", header=None,
                          names=["dt", "open", "high", "low", "close", "vol"])
         df.index = pd.to_datetime(df["dt"], format="%Y%m%d %H%M%S")
-        return df, "est"
+        return df, "newyork"
     if len(first.split(",")[0]) == 10 and first[4] == ".":  # HistData MT: 2025.01.02,18:00,...
         df = pd.read_csv(io.StringIO(text), header=None,
                          names=["d", "t", "open", "high", "low", "close", "vol"])
         df.index = pd.to_datetime(df["d"] + " " + df["t"], format="%Y.%m.%d %H:%M")
-        return df, "est"
+        return df, "newyork"
     # Dukascopy: 02.01.2025 00:00:00.000,o,h,l,c,v (UTC), possibly with a header line
     df = pd.read_csv(io.StringIO(text), header=None, comment=None,
                      names=["dt", "open", "high", "low", "close", "vol"])
@@ -120,7 +126,11 @@ def _parse(text: str) -> tuple[pd.DataFrame, str]:
 def to_broker(index: pd.DatetimeIndex, zone: str, broker_winter: int = 2,
               us_dst: bool = True) -> pd.DatetimeIndex:
     """Source time -> broker server time (GMT+2, +1 during US daylight saving)."""
-    utc = index + pd.Timedelta(hours=5) if zone == "est" else index
+    if zone == "newyork":
+        utc = index.tz_localize("America/New_York", ambiguous="NaT", nonexistent="shift_forward")
+        utc = utc.tz_convert("UTC").tz_localize(None)
+    else:
+        utc = index
     if not us_dst:
         return utc + pd.Timedelta(hours=broker_winter)
     ny = utc.tz_localize("UTC").tz_convert("America/New_York")
@@ -134,6 +144,7 @@ def load_m1(paths: list[str], broker_winter: int = 2, us_dst: bool = True) -> pd
             df, zone = _parse(text)
             df = df[["open", "high", "low", "close"]].astype(float)
             df.index = to_broker(df.index, zone, broker_winter, us_dst)
+            df = df[df.index.notna()]
             frames.append(df)
             print(f"  loaded {name}: {len(df):,} M1 bars ({zone})")
     m1 = pd.concat(frames).sort_index()

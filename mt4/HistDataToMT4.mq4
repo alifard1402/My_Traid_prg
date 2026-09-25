@@ -10,18 +10,22 @@
 //+------------------------------------------------------------------+
 #property strict
 #property script_show_inputs
-#property version     "1.01"
+#property version     "1.02"
 #property description "HistData / Dukascopy M1 CSV -> MT4 History Center import files (broker time)"
 
+// HistData says "EST without daylight saving", but its gold files follow
+// New York local time (the daily 17:00-18:00 break does not move between
+// summer and winter). Matching two LiteFinance MT4 reports confirmed it.
 enum ENUM_SRC_TZ
 {
-   SRC_EST    = 0,   // HistData.com (EST, no daylight saving)
-   SRC_UTC    = 1,   // Dukascopy (GMT/UTC)
-   SRC_BROKER = 2    // Already in broker server time
+   SRC_NEWYORK = 0,   // HistData.com (New York time)
+   SRC_UTC     = 1,   // Dukascopy (GMT/UTC)
+   SRC_BROKER  = 2,   // Already in broker server time
+   SRC_EST     = 3    // Fixed EST (UTC-5), no daylight saving
 };
 
 input string      InputFiles            = "DAT_MT_XAUUSD_M1_2025.csv"; // Files in MQL4/Files, oldest first, ';' separated
-input ENUM_SRC_TZ SourceTimeZone        = SRC_EST;
+input ENUM_SRC_TZ SourceTimeZone        = SRC_NEWYORK;
 input int         BrokerGMTOffsetWinter = 2;     // Broker server GMT offset in winter
 input bool        BrokerFollowsUSDST    = true;  // +1 hour during US summer time (most brokers: GMT+2 / GMT+3)
 
@@ -79,7 +83,9 @@ bool IsUSDST(datetime utc)
 datetime ToBroker(datetime t)
 {
    if(SourceTimeZone == SRC_BROKER) return(t);
-   datetime utc = (SourceTimeZone == SRC_EST) ? t + 5 * 3600 : t;
+   datetime utc = t;
+   if(SourceTimeZone == SRC_EST) utc = t + 5 * 3600;
+   if(SourceTimeZone == SRC_NEWYORK) utc = t + (IsUSDST(t + 5 * 3600) ? 4 : 5) * 3600;
    int offset = BrokerGMTOffsetWinter + ((BrokerFollowsUSDST && IsUSDST(utc)) ? 1 : 0);
    return(utc + offset * 3600);
 }
