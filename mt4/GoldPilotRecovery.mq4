@@ -26,8 +26,8 @@ input string   s_money               = "=== Money policy (basket) ===";
 input double   TakeProfitUSD         = 10.0;   // Min profit to close a single trade / basket
 input double   StepLossUSD           = 10.0;   // Open next trade when the LAST trade is at -this
 input double   RecoveryRatio         = 0.3333; // Basket target = ratio x worst basket drawdown
-input int      MaxTrades             = 4;      // Max trades per basket (safety limit)
-input double   MaxBasketLossUSD      = 100.0;  // Emergency stop: close basket at -this (required)
+input int      MaxTrades             = 5;      // Max trades per basket (safety limit)
+input double   MaxBasketLossUSD      = 150.0;  // Emergency stop: close basket at -this (required)
 input double   RecoveryLotMultiplier = 1.0;    // 1.0 = same lot. >1 is martingale (dangerous)
 input bool     AutoOpenRecovery      = true;   // true = EA opens recovery trades, false = alert only
 input bool     SetBrokerTPSL         = true;   // Write basket TP / emergency SL on server orders
@@ -57,9 +57,11 @@ input ENUM_TIMEFRAMES SignalTF       = PERIOD_M15; // Entry timeframe (M5 or M15
 input ENUM_TIMEFRAMES TrendTF        = PERIOD_H1;  // Higher timeframe trend filter
 input int      MinConfluence         = 1;      // Min reasons: level / zone / trendline (1-3)
 input bool     AutoTradeSignals      = true;   // Open first trade on signal automatically
-input bool     UseSessionFilter      = false;  // Auto entries only inside session (server time)
-input int      SessionStartHour      = 7;
+input bool     UseSessionFilter      = true;   // New baskets only inside session (server time)
+input int      SessionStartHour      = 10;     // 10-22 server = London open .. NY afternoon on GMT+2/+3 brokers
 input int      SessionEndHour        = 22;
+input string   NewsTimes             = "";     // Server times, ';' separated: 2026.10.02 15:30;2026.10.14 15:30
+input int      NewsBlockMinutes      = 30;     // No new basket this many minutes before/after news
 
 //==================================================================
 //                           ANALYSIS
@@ -179,6 +181,7 @@ bool     gMaxAlerted[2];
 datetime gLastOpenTry[2];
 datetime gPauseUntil = 0;
 bool     gOppAlerted = false;
+datetime gNews[];
 
 //==================================================================
 //                            UTILITY
@@ -230,6 +233,41 @@ int SlippagePoints()
 bool SpreadOK()
 {
    return(Ask - Bid <= MaxSpreadPrice + Point * 0.5);
+}
+
+string Trim(string text)
+{
+   int a = 0, b = StringLen(text) - 1;
+   while(a <= b && StringGetCharacter(text, a) <= ' ') a++;
+   while(b >= a && StringGetCharacter(text, b) <= ' ') b--;
+   if(b < a) return("");
+   return(StringSubstr(text, a, b - a + 1));
+}
+
+void ParseNews()
+{
+   ArrayResize(gNews, 0);
+   string parts[];
+   int n = StringSplit(NewsTimes, ';', parts);
+   for(int i = 0; i < n; i++)
+   {
+      string item = Trim(parts[i]);
+      if(item == "") continue;
+      datetime t = StringToTime(item);
+      if(t <= 0) { Print("NewsTimes: cannot read '", item, "' (use 2026.10.02 15:30)"); continue; }
+      int k = ArraySize(gNews);
+      ArrayResize(gNews, k + 1);
+      gNews[k] = t;
+   }
+   if(ArraySize(gNews) > 0) Print("News filter: ", ArraySize(gNews), " time(s) loaded");
+}
+
+// Returns the news time we are close to, or 0.
+datetime NearNews()
+{
+   for(int i = 0; i < ArraySize(gNews); i++)
+      if(MathAbs((double)(TimeCurrent() - gNews[i])) <= NewsBlockMinutes * 60) return(gNews[i]);
+   return(0);
 }
 
 bool InSession()
@@ -324,6 +362,7 @@ int OnInit()
       gLastOpenTry[i]     = 0;
    }
 
+   ParseNews();
    ObjectsDeleteAll(0, PREFIX);
    CreateButtons();
    EventSetTimer(1);
@@ -782,7 +821,7 @@ void TryAutoEntry()
 {
    if(gSigSide == 0) return;
    if(TimeCurrent() < gPauseUntil) return;
-   if(!InSession() || !SpreadOK()) return;
+   if(!InSession() || NearNews() > 0 || !SpreadOK()) return;
 
    BasketInfo b, s;
    ScanBasket(OP_BUY, b);
@@ -1380,6 +1419,15 @@ void UpdateDashboard()
       Row(y, "pause", "Auto entries paused after emergency stop", clrOrange);
    else
       Row(y, "pause", " ", clrGray);
+
+   datetime news = NearNews();
+   if(news > 0)
+      Row(y, "sess", "News " + TimeToString(news, TIME_MINUTES) + " - no new basket", clrOrange);
+   else if(!InSession())
+      Row(y, "sess", StringFormat("Outside session %02d-%02d - no new basket",
+                                  SessionStartHour, SessionEndHour), clrOrange);
+   else
+      Row(y, "sess", "Session open", clrSilver);
 
    ChartRedraw(0);
 }
