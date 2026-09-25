@@ -14,10 +14,12 @@
 //|       optional ATR-based recovery step                           |
 //|     - v4.3: no new basket in a quiet market or on Friday         |
 //|       (tested on 2025 and 2026 separately, see sim/RESULTS.md)   |
+//|     - v4.4: M15 / H1 built from the chart's own bars, so the     |
+//|       Strategy Tester only needs M1 + chart-timeframe history    |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.30"
-#property description "GoldPilot Recovery v4.3 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
+#property version   "4.40"
+#property description "GoldPilot Recovery v4.4 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
 
 enum ENUM_STEP_MODE
 {
@@ -112,6 +114,7 @@ input double   NearATR               = 0.5;    // "Price is at the level" distan
 input double   ImpulseATR            = 1.5;    // Min impulse candle size (x ATR)
 input int      MaxBaseCandles        = 3;
 input int      TrendlinePoints       = 6;      // Last N swings used for trendlines
+input bool     BuildTFsFromChart     = true;   // Build SignalTF / TrendTF bars from the chart (tester needs no M15/H1 history)
 
 //==================================================================
 //                       VISUAL & ALERTS
@@ -223,6 +226,13 @@ double   gSigEntry = 0, gSigInvalid = 0, gSigTarget = 0;
 string   gSigReason = "";
 
 datetime gLastBar = 0;
+
+// bars built from the chart timeframe (BuildTFsFromChart)
+datetime gT[];
+int      gTotal = 0;
+datetime gLastH1 = 0;
+double   gEmaF = 0, gEmaS = 0, gH1Close = 0;
+int      gH1Count = 0;
 double   gWorst[2];
 datetime gLastModify[2];
 int      gLastModifyCount[2];
@@ -469,11 +479,11 @@ int OnInit()
 
    RunAnalysis();
    DrawAnalysis();
-   gLastBar = iTime(NULL, SignalTF, 1);
+   gLastBar = SignalBarOpen();
    UpdateDashboard();
 
    DataCheck();
-   Print("GoldPilot Recovery v4.3 started on ", Symbol(), " ", TFName(SignalTF),
+   Print("GoldPilot Recovery v4.4 started on ", Symbol(), " ", TFName(SignalTF),
          " | $1 price move per 1 lot = ", DoubleToString(ValuePerPrice(), 2));
    return(INIT_SUCCEEDED);
 }
@@ -510,6 +520,9 @@ string SkipSummary()
 void DataCheck()
 {
    if(!DiagnosticLog) return;
+   Print(Synthetic() ? StringFormat("DIAG analysis bars: %s and %s built from the %s chart", TFName(SignalTF),
+                                    TFName(TrendTF), TFName(PERIOD_CURRENT))
+                     : "DIAG analysis bars: terminal history of each timeframe");
    int tfs[4];
    tfs[0] = PERIOD_M1; tfs[1] = Period(); tfs[2] = (int)SignalTF; tfs[3] = (int)TrendTF;
    for(int i = 0; i < 4; i++)
@@ -531,9 +544,13 @@ void DiagOnBar()
       if(!gNoDataWarned)
       {
          gNoDataWarned = true;
-         Print(StringFormat("DIAG: only %d %s bars available at %s - no analysis. Import %s and %s history (History Center).",
-                            iBars(NULL, SignalTF), TFName(SignalTF), TimeToString(TimeCurrent()),
-                            TFName(SignalTF), TFName(TrendTF)));
+         if(Synthetic())
+            Print(StringFormat("DIAG: only %d %s bars built from %d chart bars at %s - waiting for more history.",
+                               gTotal, TFName(SignalTF), Bars, TimeToString(TimeCurrent())));
+         else
+            Print(StringFormat("DIAG: only %d %s bars available at %s - no analysis. Import %s and %s history (History Center).",
+                               iBars(NULL, SignalTF), TFName(SignalTF), TimeToString(TimeCurrent()),
+                               TFName(SignalTF), TFName(TrendTF)));
       }
    }
    else
@@ -569,7 +586,7 @@ void OnDeinit(const int reason)
 //==================================================================
 void OnTick()
 {
-   datetime bar = iTime(NULL, SignalTF, 1);
+   datetime bar = SignalBarOpen();
    if(bar > 0 && bar != gLastBar)
    {
       gLastBar = bar;
@@ -594,6 +611,122 @@ void OnTimer()
 }
 
 //==================================================================
+//             SIGNAL / TREND BARS BUILT FROM THE CHART
+//==================================================================
+int TFMinutes(ENUM_TIMEFRAMES tf)
+{
+   return((tf == PERIOD_CURRENT) ? Period() : (int)tf);
+}
+
+// True when SignalTF and TrendTF are built from the chart's own bars.
+bool Synthetic()
+{
+   if(!BuildTFsFromChart) return(false);
+   int ch = Period(), sig = TFMinutes(SignalTF), trd = TFMinutes(TrendTF);
+   return(ch <= sig && sig % ch == 0 && ch <= trd && trd % ch == 0);
+}
+
+// Open time of the SignalTF bar that is forming now.
+datetime SignalBarOpen()
+{
+   if(Synthetic())
+   {
+      int sec = TFMinutes(SignalTF) * 60;
+      return((datetime)(Time[0] - Time[0] % sec));
+   }
+   return(iTime(NULL, SignalTF, 0));
+}
+
+// Open time of SignalTF bar `s` (shift, 0 = forming).
+datetime BarTime(int s)
+{
+   if(Synthetic()) return((s >= 0 && s < gTotal) ? gT[s] : 0);
+   return(iTime(NULL, SignalTF, s));
+}
+
+// Group chart bars into SignalTF buckets: gO/gH/gL/gC/gT[shift], shift 0 = forming.
+int LoadSynthetic(int need)
+{
+   int sec = TFMinutes(SignalTF) * 60;
+   ArrayResize(gO, need); ArrayResize(gH, need); ArrayResize(gL, need);
+   ArrayResize(gC, need); ArrayResize(gT, need);
+   int n = -1;
+   datetime cur = 0;
+   for(int i = 0; i < Bars; i++)
+   {
+      datetime b = (datetime)(Time[i] - Time[i] % sec);
+      if(n < 0 || b != cur)
+      {
+         if(n + 1 >= need) break;
+         n++;
+         cur = b;
+         gT[n] = b; gO[n] = Open[i]; gH[n] = High[i]; gL[n] = Low[i]; gC[n] = Close[i];
+      }
+      else
+      {
+         gO[n] = Open[i];                       // walking back in time: earliest open wins
+         gH[n] = MathMax(gH[n], High[i]);
+         gL[n] = MathMin(gL[n], Low[i]);
+      }
+   }
+   return(n + 1);
+}
+
+double TrueRange(int s)
+{
+   if(s + 1 >= gTotal) return(gH[s] - gL[s]);
+   return(MathMax(gH[s] - gL[s], MathMax(MathAbs(gH[s] - gC[s + 1]), MathAbs(gL[s] - gC[s + 1]))));
+}
+
+// Same as MT4 iATR: simple average of the true range.
+double SynthATR(int s, int period)
+{
+   double sum = 0;
+   int cnt = 0;
+   for(int k = s; k < s + period && k < gTotal; k++) { sum += TrueRange(k); cnt++; }
+   return(cnt > 0 ? sum / cnt : 0);
+}
+
+// EMA of TrendTF closes, updated once per closed TrendTF bar built from chart bars.
+void UpdateSyntheticTrend()
+{
+   int sec = TFMinutes(TrendTF) * 60;
+   datetime forming = (datetime)(Time[0] - Time[0] % sec);
+   double closes[];
+   datetime times[];
+   int n = 0;
+   datetime b = 0;
+   for(int i = 0; i < Bars; i++)
+   {
+      datetime bi = (datetime)(Time[i] - Time[i] % sec);
+      if(bi >= forming) continue;
+      if(gLastH1 > 0 && bi <= gLastH1) break;
+      if(n == 0 || bi != b)
+      {
+         ArrayResize(closes, n + 1, 1000);
+         ArrayResize(times, n + 1, 1000);
+         closes[n] = Close[i];                  // newest chart bar of the bucket = its close
+         times[n] = bi;
+         b = bi;
+         n++;
+      }
+   }
+   for(int k = n - 1; k >= 0; k--)              // oldest first
+   {
+      double c = closes[k];
+      if(gH1Count == 0) { gEmaF = c; gEmaS = c; }
+      else
+      {
+         gEmaF += (c - gEmaF) * 2.0 / (TrendFastEMA + 1);
+         gEmaS += (c - gEmaS) * 2.0 / (TrendSlowEMA + 1);
+      }
+      gH1Close = c;
+      gH1Count++;
+   }
+   if(n > 0) gLastH1 = times[0];
+}
+
+//==================================================================
 //                     ANALYSIS (closed candles)
 //==================================================================
 void RunAnalysis()
@@ -602,25 +735,38 @@ void RunAnalysis()
    gSigReason = "";
    gTLUp.valid = false;
    gTLDn.valid = false;
-   int avail = iBars(NULL, SignalTF) - ATRPeriod - 2;
-   gN = (int)MathMin(LookbackBars, avail);
-   if(gN < 50) { gTrend = 0; return; }
-
-   ArrayResize(gO, gN + 1);
-   ArrayResize(gH, gN + 1);
-   ArrayResize(gL, gN + 1);
-   ArrayResize(gC, gN + 1);
-   ArrayResize(gA, gN + 1);
-   for(int s = 0; s <= gN; s++)
+   double atrSlow = 0;
+   if(Synthetic())
    {
-      gO[s] = iOpen(NULL, SignalTF, s);
-      gH[s] = iHigh(NULL, SignalTF, s);
-      gL[s] = iLow(NULL, SignalTF, s);
-      gC[s] = iClose(NULL, SignalTF, s);
-      gA[s] = iATR(NULL, SignalTF, ATRPeriod, s);
+      gTotal = LoadSynthetic(LookbackBars + 120);
+      gN = (int)MathMin(LookbackBars, gTotal - ATRPeriod - 2);
+      if(gN < 50) { gTrend = 0; return; }
+      ArrayResize(gA, gN + 1);
+      for(int k = 0; k <= gN; k++) gA[k] = SynthATR(k, ATRPeriod);
+      atrSlow = SynthATR(1, 100);
+   }
+   else
+   {
+      int avail = iBars(NULL, SignalTF) - ATRPeriod - 2;
+      gN = (int)MathMin(LookbackBars, avail);
+      if(gN < 50) { gTrend = 0; return; }
+
+      ArrayResize(gO, gN + 1);
+      ArrayResize(gH, gN + 1);
+      ArrayResize(gL, gN + 1);
+      ArrayResize(gC, gN + 1);
+      ArrayResize(gA, gN + 1);
+      for(int s = 0; s <= gN; s++)
+      {
+         gO[s] = iOpen(NULL, SignalTF, s);
+         gH[s] = iHigh(NULL, SignalTF, s);
+         gL[s] = iLow(NULL, SignalTF, s);
+         gC[s] = iClose(NULL, SignalTF, s);
+         gA[s] = iATR(NULL, SignalTF, ATRPeriod, s);
+      }
+      atrSlow = iATR(NULL, SignalTF, 100, 1);
    }
    gATR = gA[1];
-   double atrSlow = iATR(NULL, SignalTF, 100, 1);
    gATRRatio = (atrSlow > 0) ? gATR / atrSlow : 0;
 
    FindSwings();
@@ -949,9 +1095,18 @@ int SweptSwing(bool lows, double extreme, double close)
 //------------------------------ trend ------------------------------
 void ComputeTrend()
 {
-   double c  = iClose(NULL, TrendTF, 1);
-   double f  = iMA(NULL, TrendTF, TrendFastEMA, 0, MODE_EMA, PRICE_CLOSE, 1);
-   double sl = iMA(NULL, TrendTF, TrendSlowEMA, 0, MODE_EMA, PRICE_CLOSE, 1);
+   double c = 0, f = 0, sl = 0;
+   if(Synthetic())
+   {
+      UpdateSyntheticTrend();
+      if(gH1Count >= TrendFastEMA) { c = gH1Close; f = gEmaF; sl = gEmaS; }
+   }
+   else
+   {
+      c  = iClose(NULL, TrendTF, 1);
+      f  = iMA(NULL, TrendTF, TrendFastEMA, 0, MODE_EMA, PRICE_CLOSE, 1);
+      sl = iMA(NULL, TrendTF, TrendSlowEMA, 0, MODE_EMA, PRICE_CLOSE, 1);
+   }
    gHTF = 0;
    if(c > f && f > sl) gHTF = 1;
    else if(c < f && f < sl) gHTF = -1;
@@ -1674,7 +1829,7 @@ void DrawAnalysis()
 
    if(DrawZones)
    {
-      datetime right = iTime(NULL, SignalTF, 0) + PeriodSeconds(SignalTF) * 10;
+      datetime right = BarTime(0) + PeriodSeconds(SignalTF) * 10;
       int nd = 0, ns = 0;
       for(int i = ArraySize(gZones) - 1; i >= 0; i--)
       {
@@ -1683,7 +1838,7 @@ void DrawAnalysis()
          if(!dem && ns >= MaxZonesEachSide) continue;
          string name = PREFIX + "ZN_" + IntegerToString(i);
          ObjectCreate(0, name, OBJ_RECTANGLE, 0,
-                      iTime(NULL, SignalTF, gZones[i].baseShift), gZones[i].top,
+                      BarTime(gZones[i].baseShift), gZones[i].top,
                       right, gZones[i].bottom);
          ObjectSetInteger(0, name, OBJPROP_COLOR, dem ? ColorDemand : ColorSupply);
          ObjectSetInteger(0, name, OBJPROP_BACK, true);
@@ -1696,7 +1851,7 @@ void DrawAnalysis()
 
    if(DrawFVGs)
    {
-      datetime fvRight = iTime(NULL, SignalTF, 0) + PeriodSeconds(SignalTF) * 5;
+      datetime fvRight = BarTime(0) + PeriodSeconds(SignalTF) * 5;
       int nb = 0, nr = 0;
       for(int f = 0; f < ArraySize(gFVG); f++)   // most recent first
       {
@@ -1706,7 +1861,7 @@ void DrawAnalysis()
          if(!bull && nr >= MaxZonesEachSide) continue;
          string fname = PREFIX + "FV_" + IntegerToString(f);
          ObjectCreate(0, fname, OBJ_RECTANGLE, 0,
-                      iTime(NULL, SignalTF, gFVG[f].shift + 1), gFVG[f].top, fvRight, gFVG[f].bottom);
+                      BarTime(gFVG[f].shift + 1), gFVG[f].top, fvRight, gFVG[f].bottom);
          ObjectSetInteger(0, fname, OBJPROP_COLOR, ColorFVG);
          ObjectSetInteger(0, fname, OBJPROP_BACK, true);
          ObjectSetInteger(0, fname, OBJPROP_SELECTABLE, false);
@@ -1727,7 +1882,7 @@ void DrawTL(string name, TLine &t, color c)
 {
    if(!t.valid) return;
    ObjectCreate(0, name, OBJ_TREND, 0,
-                iTime(NULL, SignalTF, t.s1), t.p1, iTime(NULL, SignalTF, t.s2), t.p2);
+                BarTime(t.s1), t.p1, BarTime(t.s2), t.p2);
    ObjectSetInteger(0, name, OBJPROP_COLOR, c);
    ObjectSetInteger(0, name, OBJPROP_WIDTH, 2);
    ObjectSetInteger(0, name, OBJPROP_RAY_RIGHT, true);
@@ -1737,7 +1892,7 @@ void DrawTL(string name, TLine &t, color c)
 
 void DrawSignalArrow()
 {
-   datetime t = iTime(NULL, SignalTF, 1);
+   datetime t = BarTime(1);
    string name = PREFIX + "SIG_" + IntegerToString((int)t);
    double p = (gSigSide > 0) ? gL[1] - gATR * 0.2 : gH[1] + gATR * 0.2;
    if(ObjectFind(0, name) < 0) ObjectCreate(0, name, OBJ_ARROW, 0, t, p);
@@ -1810,7 +1965,7 @@ void UpdateDashboard()
    int y = DashY;
    string tf = TFName(SignalTF);
 
-   Row(y, "title", "GoldPilot Recovery v4.3  " + Symbol() + " " + tf, clrGold);
+   Row(y, "title", "GoldPilot Recovery v4.4  " + Symbol() + " " + tf, clrGold);
 
    string trendTxt = (gTrend > 0) ? "BULLISH" : (gTrend < 0) ? "BEARISH" : "NEUTRAL - wait";
    Row(y, "trend", "Trend: " + trendTxt, TrendColor(gTrend));
