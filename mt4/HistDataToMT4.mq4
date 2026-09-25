@@ -10,7 +10,7 @@
 //+------------------------------------------------------------------+
 #property strict
 #property script_show_inputs
-#property version     "1.00"
+#property version     "1.01"
 #property description "HistData / Dukascopy M1 CSV -> MT4 History Center import files (broker time)"
 
 enum ENUM_SRC_TZ
@@ -137,13 +137,19 @@ void Flush(int k)
    FileWrite(gOut[k], TimeToString(gT[k], TIME_DATE), TimeToString(gT[k], TIME_MINUTES),
              DoubleToString(gO[k], gDigits), DoubleToString(gH[k], gDigits),
              DoubleToString(gL[k], gDigits), DoubleToString(gC[k], gDigits),
-             IntegerToString((int)MathMax(1, MathRound(gV[k]))));
+             IntegerToString((int)gV[k]));
    gBars[k]++;
    gOn[k] = false;
 }
 
 void AddM1(datetime t, double o, double h, double l, double c, double v)
 {
+   // HistData has volume 0. Every M1 bar gets at least 1 tick and the
+   // higher timeframes get the SUM of their M1 bars; otherwise the Strategy
+   // Tester reports "unmatched data error (volume limit ... exceeded)".
+   v = MathMax(1, MathRound(v));
+   o = NormalizeDouble(o, gDigits); h = NormalizeDouble(h, gDigits);
+   l = NormalizeDouble(l, gDigits); c = NormalizeDouble(c, gDigits);
    for(int k = 0; k < NTF; k++)
    {
       int sec = TFS[k] * 60;

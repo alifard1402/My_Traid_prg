@@ -14,8 +14,8 @@
 //|       optional ATR-based recovery step                           |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.20"
-#property description "GoldPilot Recovery v4.2 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
+#property version   "4.21"
+#property description "GoldPilot Recovery v4.21 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
 
 enum ENUM_STEP_MODE
 {
@@ -125,6 +125,7 @@ input int      MaxZonesEachSide      = 2;
 input bool     EnableAlerts          = true;
 input bool     EnablePush            = false;  // Send to MT4 mobile app (set MetaQuotes ID first)
 input bool     EnableSound           = false;
+input bool     DiagnosticLog         = true;   // Journal: data check, weekly summary, why signals were not traded
 input int      DashX                 = 10;
 input int      DashY                 = 20;
 input int      DashFontSize          = 9;
@@ -227,6 +228,13 @@ bool     gMaxAlerted[2];
 datetime gLastOpenTry[2];
 datetime gPauseUntil = 0;
 bool     gOppAlerted = false;
+
+// diagnostics
+int      gDiagBars = 0, gDiagTrendBars = 0, gDiagSignals = 0, gDiagOpened = 0, gDiagNoData = 0;
+string   gSkipKey[];
+int      gSkipCnt[];
+datetime gLastDiagPrint = 0;
+bool     gNoDataWarned = false;
 datetime gNews[];
 
 datetime gBasketStart[2];
@@ -461,13 +469,91 @@ int OnInit()
    gLastBar = iTime(NULL, SignalTF, 1);
    UpdateDashboard();
 
-   Print("GoldPilot Recovery v4.2 started on ", Symbol(), " ", TFName(SignalTF),
+   DataCheck();
+   Print("GoldPilot Recovery v4.21 started on ", Symbol(), " ", TFName(SignalTF),
          " | $1 price move per 1 lot = ", DoubleToString(ValuePerPrice(), 2));
    return(INIT_SUCCEEDED);
 }
 
+//==================================================================
+//                          DIAGNOSTICS
+//==================================================================
+void AddSkip(string key)
+{
+   for(int i = 0; i < ArraySize(gSkipKey); i++)
+      if(gSkipKey[i] == key) { gSkipCnt[i]++; return; }
+   int n = ArraySize(gSkipKey);
+   ArrayResize(gSkipKey, n + 1);
+   ArrayResize(gSkipCnt, n + 1);
+   gSkipKey[n] = key;
+   gSkipCnt[n] = 1;
+}
+
+// First word of a block reason: "session 10-22" -> "session".
+string SkipKey(string reason)
+{
+   int sp = StringFind(reason, " ");
+   return(sp > 0 ? StringSubstr(reason, 0, sp) : reason);
+}
+
+string SkipSummary()
+{
+   string txt = "";
+   for(int i = 0; i < ArraySize(gSkipKey); i++)
+      txt += StringFormat("%s=%d ", gSkipKey[i], gSkipCnt[i]);
+   return(txt == "" ? "none" : txt);
+}
+
+void DataCheck()
+{
+   if(!DiagnosticLog) return;
+   int tfs[4];
+   tfs[0] = PERIOD_M1; tfs[1] = Period(); tfs[2] = (int)SignalTF; tfs[3] = (int)TrendTF;
+   for(int i = 0; i < 4; i++)
+   {
+      int tf = (tfs[i] == 0) ? Period() : tfs[i];
+      int bars = iBars(NULL, tf);
+      datetime oldest = (bars > 0) ? iTime(NULL, tf, bars - 1) : 0;
+      Print(StringFormat("DIAG data %s: %d bars, oldest %s", TFName((ENUM_TIMEFRAMES)tf), bars,
+                         bars > 0 ? TimeToString(oldest) : "-"));
+   }
+}
+
+void DiagOnBar()
+{
+   if(!DiagnosticLog) return;
+   if(gN < 50)
+   {
+      gDiagNoData++;
+      if(!gNoDataWarned)
+      {
+         gNoDataWarned = true;
+         Print(StringFormat("DIAG: only %d %s bars available at %s - no analysis. Import %s and %s history (History Center).",
+                            iBars(NULL, SignalTF), TFName(SignalTF), TimeToString(TimeCurrent()),
+                            TFName(SignalTF), TFName(TrendTF)));
+      }
+   }
+   else
+   {
+      gDiagBars++;
+      if(gTrend != 0) gDiagTrendBars++;
+   }
+   if(gSigSide != 0) gDiagSignals++;
+
+   if(IsTesting() && TimeCurrent() - gLastDiagPrint >= 7 * 86400)
+   {
+      gLastDiagPrint = TimeCurrent();
+      Print(StringFormat("DIAG %s: analysed %d bars (no data %d), trend %d, signals %d, opened %d | skipped: %s",
+                         TimeToString(TimeCurrent(), TIME_DATE), gDiagBars, gDiagNoData, gDiagTrendBars,
+                         gDiagSignals, gDiagOpened, SkipSummary()));
+   }
+}
+
 void OnDeinit(const int reason)
 {
+   if(DiagnosticLog)
+      Print(StringFormat("DIAG total: analysed %d bars (no data %d), bars with trend %d, signals %d, baskets opened %d | skipped: %s",
+                         gDiagBars, gDiagNoData, gDiagTrendBars, gDiagSignals, gDiagOpened, SkipSummary()));
    Print(StringFormat("GoldPilot stats: baskets %d won / %d lost (emergency stops %d) | net %+.2f | worst basket drawdown %.2f",
                       gWins, gLosses, gStops, gNet, gWorstEver));
    EventKillTimer();
@@ -486,6 +572,7 @@ void OnTick()
       gLastBar = bar;
       RunAnalysis();
       DrawAnalysis();
+      DiagOnBar();
       if(gSigSide != 0) AnnounceSignal();
       if(AutoTradeSignals) TryAutoEntry();
    }
@@ -1048,6 +1135,7 @@ void TryAutoEntry()
    if(block != "")
    {
       Print("Signal skipped: ", block);
+      AddSkip(SkipKey(block));
       return;
    }
 
@@ -1056,15 +1144,17 @@ void TryAutoEntry()
    {
       Print("Signal skipped: ", Side(type), " cooldown after stop until ",
             TimeToString(gDirBlockUntil[Idx(type)], TIME_DATE | TIME_MINUTES));
+      AddSkip("cooldown");
       return;
    }
 
    BasketInfo b, s;
    ScanBasket(OP_BUY, b);
    ScanBasket(OP_SELL, s);
-   if(b.count > 0 || s.count > 0) return;   // one basket at a time
+   if(b.count > 0 || s.count > 0) { AddSkip("basket-open"); return; }   // one basket at a time
 
-   OpenMarket(type, DefaultLots, "GPR signal");
+   if(OpenMarket(type, DefaultLots, "GPR signal")) gDiagOpened++;
+   else AddSkip("order-failed");
 }
 
 //==================================================================
@@ -1715,7 +1805,7 @@ void UpdateDashboard()
    int y = DashY;
    string tf = TFName(SignalTF);
 
-   Row(y, "title", "GoldPilot Recovery v4.2  " + Symbol() + " " + tf, clrGold);
+   Row(y, "title", "GoldPilot Recovery v4.21  " + Symbol() + " " + tf, clrGold);
 
    string trendTxt = (gTrend > 0) ? "BULLISH" : (gTrend < 0) ? "BEARISH" : "NEUTRAL - wait";
    Row(y, "trend", "Trend: " + trendTxt, TrendColor(gTrend));
