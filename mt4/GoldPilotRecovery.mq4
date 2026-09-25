@@ -16,10 +16,18 @@
 //|       (tested on 2025 and 2026 separately, see sim/RESULTS.md)   |
 //|     - v4.4: M15 / H1 built from the chart's own bars, so the     |
 //|       Strategy Tester only needs M1 + chart-timeframe history    |
+//|     - v4.5: direction from the slope of the H4 EMA50 (the H1     |
+//|       EMA50/200 + M15 structure reacted late to reversals)       |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.40"
-#property description "GoldPilot Recovery v4.4 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
+#property version   "4.50"
+#property description "GoldPilot Recovery v4.5 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
+
+enum ENUM_TREND_MODE
+{
+   TREND_SLOPE     = 0,   // Slope of the SlopeTF EMA (v4.5, tested better)
+   TREND_EMA_STACK = 1    // TrendTF EMA fast/slow + SignalTF swing structure (v4.4)
+};
 
 enum ENUM_STEP_MODE
 {
@@ -71,7 +79,11 @@ input int      MaxRetries            = 3;
 //==================================================================
 input string   s_signal              = "=== Entry signal ===";
 input ENUM_TIMEFRAMES SignalTF       = PERIOD_M15; // Entry timeframe (M5 or M15)
-input ENUM_TIMEFRAMES TrendTF        = PERIOD_H1;  // Higher timeframe trend filter
+input ENUM_TREND_MODE TrendMode      = TREND_SLOPE; // How the trade direction is decided
+input ENUM_TIMEFRAMES SlopeTF        = PERIOD_H4;  // TREND_SLOPE: timeframe of the EMA
+input int      SlopeEMA              = 50;     // TREND_SLOPE: EMA period
+input int      SlopeBars             = 3;      // TREND_SLOPE: EMA now vs this many bars ago
+input ENUM_TIMEFRAMES TrendTF        = PERIOD_H1;  // TREND_EMA_STACK: trend timeframe
 input int      MinConfluence         = 2;      // Min reasons: level / zone / trendline / sweep / FVG
 input bool     AutoTradeSignals      = true;   // Open first trade on signal automatically
 input bool     UseSessionFilter      = true;   // New baskets only inside session (server time)
@@ -107,8 +119,8 @@ input int      LookbackBars          = 300;
 input int      SwingLeft             = 3;      // Bars before a swing high/low
 input int      SwingRight            = 3;      // Bars after (confirmation delay)
 input int      ATRPeriod             = 14;
-input int      TrendFastEMA          = 50;
-input int      TrendSlowEMA          = 200;
+input int      TrendFastEMA          = 50;     // TREND_EMA_STACK
+input int      TrendSlowEMA          = 200;    // TREND_EMA_STACK
 input double   LevelToleranceATR     = 0.5;    // Swings closer than this (x ATR) = same level
 input double   NearATR               = 0.5;    // "Price is at the level" distance (x ATR)
 input double   ImpulseATR            = 1.5;    // Min impulse candle size (x ATR)
@@ -233,6 +245,7 @@ int      gTotal = 0;
 datetime gLastH1 = 0;
 double   gEmaF = 0, gEmaS = 0, gH1Close = 0;
 int      gH1Count = 0;
+double   gEmaHist[];      // fast EMA after each closed trend bar (newest last)
 double   gWorst[2];
 datetime gLastModify[2];
 int      gLastModifyCount[2];
@@ -483,7 +496,7 @@ int OnInit()
    UpdateDashboard();
 
    DataCheck();
-   Print("GoldPilot Recovery v4.4 started on ", Symbol(), " ", TFName(SignalTF),
+   Print("GoldPilot Recovery v4.5 started on ", Symbol(), " ", TFName(SignalTF),
          " | $1 price move per 1 lot = ", DoubleToString(ValuePerPrice(), 2));
    return(INIT_SUCCEEDED);
 }
@@ -521,10 +534,10 @@ void DataCheck()
 {
    if(!DiagnosticLog) return;
    Print(Synthetic() ? StringFormat("DIAG analysis bars: %s and %s built from the %s chart", TFName(SignalTF),
-                                    TFName(TrendTF), TFName(PERIOD_CURRENT))
+                                    TFName(TrendSourceTF()), TFName(PERIOD_CURRENT))
                      : "DIAG analysis bars: terminal history of each timeframe");
    int tfs[4];
-   tfs[0] = PERIOD_M1; tfs[1] = Period(); tfs[2] = (int)SignalTF; tfs[3] = (int)TrendTF;
+   tfs[0] = PERIOD_M1; tfs[1] = Period(); tfs[2] = (int)SignalTF; tfs[3] = (int)TrendSourceTF();
    for(int i = 0; i < 4; i++)
    {
       int tf = (tfs[i] == 0) ? Period() : tfs[i];
@@ -550,7 +563,7 @@ void DiagOnBar()
          else
             Print(StringFormat("DIAG: only %d %s bars available at %s - no analysis. Import %s and %s history (History Center).",
                                iBars(NULL, SignalTF), TFName(SignalTF), TimeToString(TimeCurrent()),
-                               TFName(SignalTF), TFName(TrendTF)));
+                               TFName(SignalTF), TFName(TrendSourceTF())));
       }
    }
    else
@@ -618,11 +631,21 @@ int TFMinutes(ENUM_TIMEFRAMES tf)
    return((tf == PERIOD_CURRENT) ? Period() : (int)tf);
 }
 
-// True when SignalTF and TrendTF are built from the chart's own bars.
+ENUM_TIMEFRAMES TrendSourceTF()
+{
+   return(TrendMode == TREND_SLOPE ? SlopeTF : TrendTF);
+}
+
+int TrendFastPeriod()
+{
+   return(TrendMode == TREND_SLOPE ? SlopeEMA : TrendFastEMA);
+}
+
+// True when SignalTF and the trend timeframe are built from the chart's own bars.
 bool Synthetic()
 {
    if(!BuildTFsFromChart) return(false);
-   int ch = Period(), sig = TFMinutes(SignalTF), trd = TFMinutes(TrendTF);
+   int ch = Period(), sig = TFMinutes(SignalTF), trd = TFMinutes(TrendSourceTF());
    return(ch <= sig && sig % ch == 0 && ch <= trd && trd % ch == 0);
 }
 
@@ -690,7 +713,7 @@ double SynthATR(int s, int period)
 // EMA of TrendTF closes, updated once per closed TrendTF bar built from chart bars.
 void UpdateSyntheticTrend()
 {
-   int sec = TFMinutes(TrendTF) * 60;
+   int sec = TFMinutes(TrendSourceTF()) * 60;
    datetime forming = (datetime)(Time[0] - Time[0] % sec);
    double closes[];
    datetime times[];
@@ -717,11 +740,22 @@ void UpdateSyntheticTrend()
       if(gH1Count == 0) { gEmaF = c; gEmaS = c; }
       else
       {
-         gEmaF += (c - gEmaF) * 2.0 / (TrendFastEMA + 1);
+         gEmaF += (c - gEmaF) * 2.0 / (TrendFastPeriod() + 1);
          gEmaS += (c - gEmaS) * 2.0 / (TrendSlowEMA + 1);
       }
       gH1Close = c;
       gH1Count++;
+      int hn = ArraySize(gEmaHist);
+      if(hn >= 64)
+      {
+         for(int m = 1; m < hn; m++) gEmaHist[m - 1] = gEmaHist[m];
+         gEmaHist[hn - 1] = gEmaF;
+      }
+      else
+      {
+         ArrayResize(gEmaHist, hn + 1);
+         gEmaHist[hn] = gEmaF;
+      }
    }
    if(n > 0) gLastH1 = times[0];
 }
@@ -1095,6 +1129,48 @@ int SweptSwing(bool lows, double extreme, double close)
 //------------------------------ trend ------------------------------
 void ComputeTrend()
 {
+   // swing structure (used by TREND_EMA_STACK, shown on the dashboard in both modes)
+   gStruct = 0;
+   int nh = ArraySize(gSwH), nl = ArraySize(gSwL);
+   if(nh >= 2 && nl >= 2)
+   {
+      bool hh = gSwH[nh - 1].price > gSwH[nh - 2].price;
+      bool hl = gSwL[nl - 1].price > gSwL[nl - 2].price;
+      bool lh = gSwH[nh - 1].price < gSwH[nh - 2].price;
+      bool ll = gSwL[nl - 1].price < gSwL[nl - 2].price;
+      if(hh && hl) gStruct = 1;
+      else if(lh && ll) gStruct = -1;
+   }
+
+   if(TrendMode == TREND_SLOPE)
+   {
+      // Direction = is the SlopeTF EMA higher or lower than SlopeBars closed bars ago?
+      double now = 0, before = 0;
+      if(Synthetic())
+      {
+         UpdateSyntheticTrend();
+         int hn = ArraySize(gEmaHist);
+         if(gH1Count >= SlopeEMA && hn > SlopeBars)
+         {
+            now = gEmaHist[hn - 1];
+            before = gEmaHist[hn - 1 - SlopeBars];
+         }
+      }
+      else
+      {
+         now    = iMA(NULL, SlopeTF, SlopeEMA, 0, MODE_EMA, PRICE_CLOSE, 1);
+         before = iMA(NULL, SlopeTF, SlopeEMA, 0, MODE_EMA, PRICE_CLOSE, 1 + SlopeBars);
+      }
+      gHTF = 0;
+      if(now > 0 && before > 0)
+      {
+         if(now > before) gHTF = 1;
+         else if(now < before) gHTF = -1;
+      }
+      gTrend = gHTF;
+      return;
+   }
+
    double c = 0, f = 0, sl = 0;
    if(Synthetic())
    {
@@ -1110,18 +1186,6 @@ void ComputeTrend()
    gHTF = 0;
    if(c > f && f > sl) gHTF = 1;
    else if(c < f && f < sl) gHTF = -1;
-
-   gStruct = 0;
-   int nh = ArraySize(gSwH), nl = ArraySize(gSwL);
-   if(nh >= 2 && nl >= 2)
-   {
-      bool hh = gSwH[nh - 1].price > gSwH[nh - 2].price;
-      bool hl = gSwL[nl - 1].price > gSwL[nl - 2].price;
-      bool lh = gSwH[nh - 1].price < gSwH[nh - 2].price;
-      bool ll = gSwL[nl - 1].price < gSwL[nl - 2].price;
-      if(hh && hl) gStruct = 1;
-      else if(lh && ll) gStruct = -1;
-   }
 
    // Trend only when the two views do not disagree.
    if(gHTF * gStruct < 0) gTrend = 0;
@@ -1965,11 +2029,13 @@ void UpdateDashboard()
    int y = DashY;
    string tf = TFName(SignalTF);
 
-   Row(y, "title", "GoldPilot Recovery v4.4  " + Symbol() + " " + tf, clrGold);
+   Row(y, "title", "GoldPilot Recovery v4.5  " + Symbol() + " " + tf, clrGold);
 
    string trendTxt = (gTrend > 0) ? "BULLISH" : (gTrend < 0) ? "BEARISH" : "NEUTRAL - wait";
    Row(y, "trend", "Trend: " + trendTxt, TrendColor(gTrend));
-   Row(y, "trend2", StringFormat(" %s EMA: %s | %s swings: %s", TFName(TrendTF), TrendName(gHTF),
+   Row(y, "trend2", StringFormat(" %s %s: %s | %s swings: %s", TFName(TrendSourceTF()),
+                                 TrendMode == TREND_SLOPE ? StringFormat("EMA%d slope", SlopeEMA) : "EMA",
+                                 TrendName(gHTF),
                                  tf, gStruct > 0 ? "HH/HL" : gStruct < 0 ? "LH/LL" : "mixed"),
        clrSilver);
    Row(y, "atr", StringFormat("ATR %.2f | Spread %.2f", gATR, Ask - Bid),

@@ -1,4 +1,4 @@
-"""GoldPilot Recovery v4.3 — Python simulator for fast what-if backtests.
+"""GoldPilot Recovery v4.5 — Python simulator for fast what-if backtests.
 
 The MT4 Strategy Tester is the reference. This simulator re-implements the
 EA's logic so many parameter sets can be compared in minutes:
@@ -56,6 +56,12 @@ class Params:
     min_atr_ratio: float = 0.8          # no new basket when ATR14/ATR100 is below this
     add_on_bar_close: bool = False      # recovery trade only at the close of an M15 bar
     max_weekly_loss_usd: float = 0.0    # no new basket for the rest of the week after this closed loss
+    # higher-timeframe direction used with the M15 structure:
+    #   h1ema = H1 EMA50/200 (EA <= v4.4), h4slope = slope of the H4 EMA50 over 3 bars,
+    #   d1ema = D1 EMA20/50, h4slope_only = H4 slope alone (structure ignored)
+    trend_mode: str = "h4slope_only"
+    h4_ema: int = 50
+    h4_slope_bars: int = 3
     use_session: bool = True
     session_start: int = 10
     session_end: int = 22
@@ -226,6 +232,10 @@ def compute_signals(m15: pd.DataFrame, h1: pd.DataFrame, p: Params,
     d1_s = d1["close"].ewm(span=50, adjust=False).mean().to_numpy()
     d1_c = d1["close"].to_numpy()
     d1_close_time = (d1.index + pd.Timedelta(days=1)).to_numpy()
+    h4 = h1.resample("4h").agg({"open": "first", "high": "max", "low": "min", "close": "last"}).dropna()
+    h4_ema = h4["close"].ewm(span=p.h4_ema, adjust=False).mean()
+    h4_slope = np.sign(h4_ema - h4_ema.shift(p.h4_slope_bars)).fillna(0).to_numpy()
+    h4_close_time = (h4.index + pd.Timedelta(hours=4)).to_numpy()
 
     rows: list[SignalRow] = []
     first_i = 0
@@ -267,7 +277,6 @@ def compute_signals(m15: pd.DataFrame, h1: pd.DataFrame, p: Params,
                 struct = 1
             elif h_last < h_prev and l_last < l_prev:
                 struct = -1
-        trend = 0 if htf * struct < 0 else (struct if struct != 0 else htf)
         kd = int(np.searchsorted(d1_close_time, np.datetime64(eval_time), side="right")) - 1
         d1_trend = 0
         if kd >= 0:
@@ -275,6 +284,16 @@ def compute_signals(m15: pd.DataFrame, h1: pd.DataFrame, p: Params,
                 d1_trend = 1
             elif d1_c[kd] < d1_f[kd] < d1_s[kd]:
                 d1_trend = -1
+        k4 = int(np.searchsorted(h4_close_time, np.datetime64(eval_time), side="right")) - 1
+        h4s = int(h4_slope[k4]) if k4 >= 0 else 0
+        if p.trend_mode == "h4slope":
+            htf = h4s
+        elif p.trend_mode == "d1ema":
+            htf = d1_trend
+        if p.trend_mode == "h4slope_only":
+            trend = h4s
+        else:
+            trend = 0 if htf * struct < 0 else (struct if struct != 0 else htf)
 
         o1, h1_, l1, c1 = O[i], H[i], L[i], C[i]
         side = 0
@@ -674,7 +693,7 @@ def summary(res: Result) -> dict:
 
 
 SCENARIOS: dict[str, dict] = {
-    "A  base v4.3": {},
+    "A  base v4.5": {},
     "B  no direction cooldown": {"direction_cooldown_h": 0},
     "C  no weekend close": {"close_before_weekend": False},
     "D  ATR step, 4 trades": {"step_mode_atr": True, "max_trades": 4},
@@ -712,7 +731,7 @@ def main(argv: list[str] | None = None) -> int:
     signals = compute_signals(m15, h1, base, start)
     m15_atr = pd.Series(mt4_atr(m15, base.atr_period), index=m15.index)
 
-    runs = SCENARIOS if args.scenarios else {"A  base v4.3": {}}
+    runs = SCENARIOS if args.scenarios else {"A  base v4.5": {}}
     rows = []
     for name, over in runs.items():
         p = replace(base, **over)
