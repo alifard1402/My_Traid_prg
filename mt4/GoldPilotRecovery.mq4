@@ -24,7 +24,7 @@
 //|       small balances): price distances stay the tested ones      |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.70"
+#property version   "4.71"
 #property description "GoldPilot Recovery v4.7 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
 
 enum ENUM_TREND_MODE
@@ -56,6 +56,7 @@ input double   StepATRMult           = 1.5;    // STEP_ATR: step = this x ATR pr
 input ENUM_TIMEFRAMES StepATRTF      = PERIOD_M15; // STEP_ATR: ATR timeframe
 input double   RecoveryRatio         = 0.3333; // Basket target = ratio x worst basket drawdown
 input bool     ScaleMoneyToLot       = true;   // $ inputs are for 0.01 lot of standard gold; scale to DefaultLots and account currency
+input double   MaxStopPctOfBalance   = 50.0;   // Refuse to start if the emergency stop is above this % of balance (0 = no check)
 input double   TrailProfitUSD        = 10.0;   // At the target, trail the basket profit by this (0 = close at target)
 input int      DeepTrades            = 5;      // Baskets with this many trades use DeepTargetUSD (0 = off)
 input double   DeepTargetUSD         = 10.0;   // Target of deep baskets instead of the 1/3 rule
@@ -507,9 +508,15 @@ int OnInit()
    Print(StringFormat("Money scale %.4f (%s): target %.2f, step %.2f, emergency stop %.2f %s = %.1f%% of balance",
                       gScale, ScaleMoneyToLot ? "scaled to DefaultLots" : "inputs as is", gTP, gStep, gStop,
                       AccountCurrency(), balance > 0 ? gStop / balance * 100 : 0));
-   if(balance > 0 && gStop > 0.5 * balance)
-      Alert(StringFormat("GoldPilot: emergency stop %.2f is %.0f%% of the balance - the lot is too big for this account " +
-                         "(use a smaller DefaultLots or a cent account).", gStop, gStop / balance * 100));
+   // Backtests showed a $100 account at 0.01 lot (stop = 150% of balance) was wiped out
+   // from about 40% of start dates. Refuse to run with such an oversized stop.
+   if(MaxStopPctOfBalance > 0 && balance > 0 && gStop > MaxStopPctOfBalance / 100.0 * balance)
+   {
+      Alert(StringFormat("GoldPilot NOT started: emergency stop %.2f is %.0f%% of the balance (limit %.0f%%). " +
+                         "Use a smaller DefaultLots / a cent account, or raise MaxStopPctOfBalance.",
+                         gStop, gStop / balance * 100, MaxStopPctOfBalance));
+      return(INIT_PARAMETERS_INCORRECT);
+   }
    if(RecoveryLotMultiplier > 1.0)
       Print("WARNING: RecoveryLotMultiplier > 1 is a martingale - losses grow much faster.");
    if(SignalTF != PERIOD_M5 && SignalTF != PERIOD_M15 && SignalTF != PERIOD_CURRENT)
