@@ -20,10 +20,12 @@
 //|       EMA50/200 + M15 structure reacted late to reversals)       |
 //|     - v4.6: profit trailing at the target (server SL follows the |
 //|       locked profit) and +10 target for 5-trade baskets          |
+//|     - v4.7: money inputs scale with DefaultLots (cent accounts,   |
+//|       small balances): price distances stay the tested ones      |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.60"
-#property description "GoldPilot Recovery v4.6 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
+#property version   "4.70"
+#property description "GoldPilot Recovery v4.7 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
 
 enum ENUM_TREND_MODE
 {
@@ -53,6 +55,7 @@ input ENUM_STEP_MODE StepMode         = STEP_FIXED; // Recovery step: fixed $ or
 input double   StepATRMult           = 1.5;    // STEP_ATR: step = this x ATR price move (never below StepLossUSD)
 input ENUM_TIMEFRAMES StepATRTF      = PERIOD_M15; // STEP_ATR: ATR timeframe
 input double   RecoveryRatio         = 0.3333; // Basket target = ratio x worst basket drawdown
+input bool     ScaleMoneyToLot       = true;   // $ inputs are for 0.01 lot of standard gold; scale to DefaultLots and account currency
 input double   TrailProfitUSD        = 10.0;   // At the target, trail the basket profit by this (0 = close at target)
 input int      DeepTrades            = 5;      // Baskets with this many trades use DeepTargetUSD (0 = off)
 input double   DeepTargetUSD         = 10.0;   // Target of deep baskets instead of the 1/3 rule
@@ -272,6 +275,8 @@ datetime gBasketStart[2];
 datetime gDirBlockUntil[2];
 bool     gWeekendAlerted[2];
 bool     gTrailOn[2];
+// money settings in account currency, scaled to DefaultLots (ScaleMoneyToLot)
+double   gScale = 1, gTP = 0, gStep = 0, gStop = 0, gTrail = 0, gDeepTgt = 0, gDaily = 0, gWeekendLoss = 0;
 double   gTrailFloor[2];
 string   gCloseReason[2];
 int      gWins = 0, gLosses = 0, gStops = 0;
@@ -437,9 +442,9 @@ datetime LoadDirBlock(int idx)
 // Money loss of the LAST trade that triggers the next recovery trade.
 double StepMoney(double lots)
 {
-   if(StepMode == STEP_FIXED || lots <= 0) return(StepLossUSD);
+   if(StepMode == STEP_FIXED || lots <= 0) return(gStep);
    double atr = iATR(NULL, StepATRTF, ATRPeriod, 1);
-   return(MathMax(StepLossUSD, StepATRMult * atr * ValuePerPrice() * lots));
+   return(MathMax(gStep, StepATRMult * atr * ValuePerPrice() * lots));
 }
 
 bool IsWeekendCloseTime()
@@ -448,10 +453,33 @@ bool IsWeekendCloseTime()
           TimeHour(TimeCurrent()) >= WeekendCloseHour);
 }
 
+// Account money per 1.0 price move of one DefaultLots trade. 1.0 for 0.01 lot of
+// standard gold in a USD account, so the inputs keep their tested meaning there.
+double MoneyScale()
+{
+   if(!ScaleMoneyToLot) return(1.0);
+   double vpp = ValuePerPrice();
+   double lots = NormalizeLots(MathMin(DefaultLots, MaxLotPerTrade));
+   if(vpp <= 0 || lots <= 0) return(1.0);
+   return(lots * vpp);
+}
+
+void InitMoney()
+{
+   gScale       = MoneyScale();
+   gTP          = TakeProfitUSD * gScale;
+   gStep        = StepLossUSD * gScale;
+   gStop        = MaxBasketLossUSD * gScale;
+   gTrail       = TrailProfitUSD * gScale;
+   gDeepTgt     = DeepTargetUSD * gScale;
+   gDaily       = MaxDailyLossUSD * gScale;
+   gWeekendLoss = WeekendCloseMaxLossUSD * gScale;
+}
+
 double Target(int idx, int count)
 {
-   if(DeepTrades > 0 && count >= DeepTrades) return(DeepTargetUSD);
-   return(MathMax(TakeProfitUSD, RecoveryRatio * (-gWorst[idx])));
+   if(DeepTrades > 0 && count >= DeepTrades) return(gDeepTgt);
+   return(MathMax(gTP, RecoveryRatio * (-gWorst[idx])));
 }
 
 //==================================================================
@@ -459,9 +487,10 @@ double Target(int idx, int count)
 //==================================================================
 int OnInit()
 {
-   if(TakeProfitUSD <= 0 || StepLossUSD <= 0 || MaxBasketLossUSD <= 0 || MaxTrades < 1 ||
+   InitMoney();
+   if(gTP <= 0 || gStep <= 0 || gStop <= 0 || MaxTrades < 1 ||
       RecoveryRatio <= 0 || RecoveryRatio > 1 || RecoveryLotMultiplier <= 0 || DefaultLots <= 0 ||
-      TrailProfitUSD < 0 || DeepTargetUSD < 0 ||
+      gTrail < 0 || gDeepTgt < 0 ||
       MaxLotPerTrade < DefaultLots)
    {
       Alert("GoldPilot Recovery: invalid money settings. TakeProfitUSD, StepLossUSD, ",
@@ -469,11 +498,18 @@ int OnInit()
       return(INIT_PARAMETERS_INCORRECT);
    }
 
-   double lossAtLastAdd = StepLossUSD * MaxTrades * (MaxTrades - 1) / 2.0;
-   if(StepMode == STEP_FIXED && MaxBasketLossUSD <= lossAtLastAdd)
-      Print("WARNING: MaxBasketLossUSD (", DoubleToString(MaxBasketLossUSD, 2),
+   double lossAtLastAdd = gStep * MaxTrades * (MaxTrades - 1) / 2.0;
+   if(StepMode == STEP_FIXED && gStop <= lossAtLastAdd)
+      Print("WARNING: emergency stop (", DoubleToString(gStop, 2),
             ") is reached before trade #", MaxTrades, " can open (basket is already at -",
             DoubleToString(lossAtLastAdd, 2), " then).");
+   double balance = AccountBalance();
+   Print(StringFormat("Money scale %.4f (%s): target %.2f, step %.2f, emergency stop %.2f %s = %.1f%% of balance",
+                      gScale, ScaleMoneyToLot ? "scaled to DefaultLots" : "inputs as is", gTP, gStep, gStop,
+                      AccountCurrency(), balance > 0 ? gStop / balance * 100 : 0));
+   if(balance > 0 && gStop > 0.5 * balance)
+      Alert(StringFormat("GoldPilot: emergency stop %.2f is %.0f%% of the balance - the lot is too big for this account " +
+                         "(use a smaller DefaultLots or a cent account).", gStop, gStop / balance * 100));
    if(RecoveryLotMultiplier > 1.0)
       Print("WARNING: RecoveryLotMultiplier > 1 is a martingale - losses grow much faster.");
    if(SignalTF != PERIOD_M5 && SignalTF != PERIOD_M15 && SignalTF != PERIOD_CURRENT)
@@ -507,7 +543,7 @@ int OnInit()
    UpdateDashboard();
 
    DataCheck();
-   Print("GoldPilot Recovery v4.6 started on ", Symbol(), " ", TFName(SignalTF),
+   Print("GoldPilot Recovery v4.7 started on ", Symbol(), " ", TFName(SignalTF),
          " | $1 price move per 1 lot = ", DoubleToString(ValuePerPrice(), 2));
    return(INIT_SUCCEEDED);
 }
@@ -1358,7 +1394,7 @@ string EntryBlockReason()
       return(StringFormat("volatility x%.1f", gATRRatio));
    if(MinATRRatio > 0 && gATRRatio > 0 && gATRRatio < MinATRRatio)
       return(StringFormat("quiet x%.2f", gATRRatio));
-   if(MaxDailyLossUSD > 0 && TodayClosedPL() <= -MaxDailyLossUSD) return("daily loss limit");
+   if(gDaily > 0 && TodayClosedPL() <= -gDaily) return("daily loss limit");
    if(!SpreadOK()) return("spread");
    return("");
 }
@@ -1526,16 +1562,16 @@ void ManageBasket(int type)
          CloseBasket(type);
          return;
       }
-      gTrailFloor[idx] = MathMax(gTrailFloor[idx], b.profit - TrailProfitUSD);
+      gTrailFloor[idx] = MathMax(gTrailFloor[idx], b.profit - gTrail);
       if(SetBrokerTPSL) SyncTPSL(type, b, target);
       return;
    }
    if(b.profit >= target)
    {
-      if(TrailProfitUSD > 0)
+      if(gTrail > 0)
       {
          gTrailOn[idx] = true;
-         gTrailFloor[idx] = MathMax(target, b.profit - TrailProfitUSD);
+         gTrailFloor[idx] = MathMax(target, b.profit - gTrail);
          Print(StringFormat("%s %s basket at %+.2f: trailing, profit floor %+.2f",
                             Symbol(), Side(type), b.profit, gTrailFloor[idx]));
          if(SetBrokerTPSL) SyncTPSL(type, b, target);
@@ -1547,7 +1583,7 @@ void ManageBasket(int type)
    }
 
    // 2) Emergency stop.
-   if(b.profit <= -MaxBasketLossUSD)
+   if(b.profit <= -gStop)
    {
       gCloseReason[idx] = "stop";
       gPauseUntil = TimeCurrent() + PauseAfterStopMinutes * 60;
@@ -1558,7 +1594,7 @@ void ManageBasket(int type)
    // 3) Weekend: close the basket before the Friday close unless it is deep in loss.
    if(IsWeekendCloseTime())
    {
-      if(b.profit >= -WeekendCloseMaxLossUSD)
+      if(b.profit >= -gWeekendLoss)
       {
          gCloseReason[idx] = "weekend";
          CloseBasket(type);
@@ -1568,7 +1604,7 @@ void ManageBasket(int type)
       {
          gWeekendAlerted[idx] = true;
          Notify(StringFormat("%s %s basket at %.2f is held over the weekend (weekend close needs >= -%.2f)",
-                             Symbol(), Side(type), b.profit, WeekendCloseMaxLossUSD));
+                             Symbol(), Side(type), b.profit, gWeekendLoss));
       }
    }
 
@@ -1602,7 +1638,7 @@ void ManageBasket(int type)
       {
          gMaxAlerted[idx] = true;
          Notify(StringFormat("%s %s basket: MaxTrades (%d) reached. Holding for target %.2f or stop -%.2f",
-                             Symbol(), Side(type), MaxTrades, target, MaxBasketLossUSD));
+                             Symbol(), Side(type), MaxTrades, target, gStop));
       }
    }
 
@@ -1634,7 +1670,7 @@ void FinishBasket(int type)
    if(reason == "")   // closed on the server (TP/SL) or by hand
    {
       if(result >= 0) reason = "target (server)";
-      else if(result <= -0.8 * MaxBasketLossUSD) reason = "stop (server)";
+      else if(result <= -0.8 * gStop) reason = "stop (server)";
       else reason = "manual";
    }
    bool stopped = (StringFind(reason, "stop") >= 0);
@@ -1690,9 +1726,9 @@ void SyncTPSL(int type, BasketInfo &b, double target)
 
    // With trailing the target is handled by the EA (no server TP). Once trailing,
    // the server SL sits at the locked profit, otherwise at the emergency stop.
-   bool trailing = (TrailProfitUSD > 0);
+   bool trailing = (gTrail > 0);
    double tp = trailing ? 0 : NormalizeDouble(PriceForMoney(type, b, target), Digits);
-   double sl = NormalizeDouble(PriceForMoney(type, b, gTrailOn[idx] ? gTrailFloor[idx] : -MaxBasketLossUSD), Digits);
+   double sl = NormalizeDouble(PriceForMoney(type, b, gTrailOn[idx] ? gTrailFloor[idx] : -gStop), Digits);
    if(!trailing && tp <= 0) return;
    if(sl < 0) sl = 0;
 
@@ -2048,8 +2084,8 @@ void BasketRows(int &y, int type)
    }
 
    double worst = MathMin(gWorst[idx], b.profit);
-   double target = (DeepTrades > 0 && b.count >= DeepTrades) ? DeepTargetUSD
-                                                             : MathMax(TakeProfitUSD, RecoveryRatio * (-worst));
+   double target = (DeepTrades > 0 && b.count >= DeepTrades) ? gDeepTgt
+                                                             : MathMax(gTP, RecoveryRatio * (-worst));
    color c = (b.profit >= 0) ? clrLime : clrOrange;
    Row(y, k + "1", StringFormat("%s x%d %.2f lot  P/L %+.2f  worst %.2f",
                                 Side(type), b.count, b.lots, b.profit, worst), c);
@@ -2062,7 +2098,7 @@ void BasketRows(int &y, int type)
       Row(y, k + "2", StringFormat("  TP %+.2f @%s  next add @%s",
                                    target, Px(PriceForMoney(type, b, target)), add), clrSilver);
    Row(y, k + "3", StringFormat("  STOP -%.2f @%s",
-                                MaxBasketLossUSD, Px(PriceForMoney(type, b, -MaxBasketLossUSD))),
+                                gStop, Px(PriceForMoney(type, b, -gStop))),
        clrTomato);
 }
 
@@ -2072,7 +2108,7 @@ void UpdateDashboard()
    int y = DashY;
    string tf = TFName(SignalTF);
 
-   Row(y, "title", "GoldPilot Recovery v4.6  " + Symbol() + " " + tf, clrGold);
+   Row(y, "title", "GoldPilot Recovery v4.7  " + Symbol() + " " + tf, clrGold);
 
    string trendTxt = (gTrend > 0) ? "BULLISH" : (gTrend < 0) ? "BEARISH" : "NEUTRAL - wait";
    Row(y, "trend", "Trend: " + trendTxt, TrendColor(gTrend));
@@ -2123,7 +2159,7 @@ void UpdateDashboard()
    Row(y, "step", StringFormat("Step $%.2f = %.2f price @ %.2f lot%s", stepMoney, stepDist, DefaultLots,
                                StepMode == STEP_ATR ? " (ATR)" : ""), clrSilver);
    double bal = AccountBalance();
-   double riskPct = (bal > 0) ? MaxBasketLossUSD / bal * 100 : 0;
+   double riskPct = (bal > 0) ? gStop / bal * 100 : 0;
    Row(y, "risk", StringFormat("Emergency stop = %.1f%% of balance", riskPct),
        riskPct > 20 ? clrRed : riskPct > 10 ? clrOrange : clrSilver);
    string block = EntryBlockReason();

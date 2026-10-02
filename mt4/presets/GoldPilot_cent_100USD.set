@@ -1,0 +1,12 @@
+DefaultLots=0.10
+MaxLotPerTrade=0.20
+ScaleMoneyToLot=1
+TakeProfitUSD=10
+StepLossUSD=10
+TrailProfitUSD=10
+DeepTrades=5
+DeepTargetUSD=10
+MaxTrades=5
+MaxBasketLossUSD=150
+MaxDailyLossUSD=150
+WeekendCloseMaxLossUSD=20
