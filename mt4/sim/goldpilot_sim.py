@@ -73,6 +73,13 @@ class Params:
     cluster_days: float = 5.0           # ... within this many days ...
     cluster_pause_h: float = 72.0       # ... no new basket for this many hours
     no_add_rollover: bool = False       # no recovery adds 23:30-01:30 server (daily reopen gap)
+    # automatic lot (compounding): emergency stop of a new basket = risk_pct % of balance.
+    # Money inputs are for `lots`; every basket scales them by its own lot / lots.
+    risk_pct: float = 10.0              # 0 = fixed `lots` (EA: AutoLot, RiskPerBasketPct)
+    lot_step: float = 0.01
+    min_lot: float = 0.01
+    max_lot: float = 100.0
+    max_stop_pct: float = 50.0          # no new basket if the minimum lot risks more than this
     use_session: bool = True
     session_start: int = 10
     session_end: int = 22
@@ -459,6 +466,7 @@ class Basket:
     entries: list = field(default_factory=list)  # (fill price, lots)
     worst: float = 0.0
     floor: float | None = None                   # trailing profit floor (money)
+    k: float = 1.0                               # money scale of this basket (its lot / Params.lots)
 
     @property
     def lots(self) -> float:
@@ -530,12 +538,19 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
     last_bar15 = None
     close_reason = ""
 
+    def lot_for_balance() -> float:
+        if p.risk_pct <= 0:
+            return p.lots
+        stop_per_lot = p.max_basket_loss_usd / p.lots
+        lot = np.floor(balance * p.risk_pct / 100.0 / stop_per_lot / p.lot_step + 1e-9) * p.lot_step
+        return float(min(p.max_lot, max(p.min_lot, lot)))
+
     def step_money(lots: float, now: pd.Timestamp) -> float:
         if not p.step_mode_atr or m15_atr is None:
-            return p.step_loss_usd
+            return p.step_loss_usd * lots / p.lots
         k = m15_atr.index.searchsorted(now, side="right") - 2   # last closed M15 bar
         atr = float(m15_atr.iloc[max(k, 0)])
-        return max(p.step_loss_usd, p.step_atr_mult * atr * CONTRACT * lots)
+        return max(p.step_loss_usd * lots / p.lots, p.step_atr_mult * atr * CONTRACT * lots)
 
     def equity_point(bid: float):
         nonlocal peak_eq, max_dd, max_dd_pct
@@ -556,6 +571,7 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
         day = now.normalize()
         day_pl[day] = day_pl.get(day, 0.0) + res
         records.append({"open": basket.start, "close": now, "side": "BUY" if basket.side > 0 else "SELL",
+                        "lot": basket.entries[0][1], "balance_after": round(balance, 2),
                         "trades": len(basket.entries), "worst": round(worst, 2), "result": round(res, 2),
                         "reason": reason})
         if reason == "stop":
@@ -572,8 +588,8 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
 
     def target_of(b: Basket) -> float:
         if p.deep_trades > 0 and len(b.entries) >= p.deep_trades:
-            return p.deep_target_usd
-        return max(p.take_profit_usd, p.recovery_ratio * -b.worst)
+            return p.deep_target_usd * b.k
+        return max(p.take_profit_usd * b.k, p.recovery_ratio * -b.worst)
 
     def move(p0: float, p1: float, now: pd.Timestamp):
         """Walk the Bid from p0 to p1 and fire adds / stop / target at their levels."""
@@ -589,12 +605,12 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
                 fill = min(lvl, cur) if basket.side > 0 else max(lvl, cur)
                 finish(fill, now, "target")
                 return
-            basket.floor = max(basket.floor, basket.pnl(p1, p.spread) - p.trail_usd)
+            basket.floor = max(basket.floor, basket.pnl(p1, p.spread) - p.trail_usd * basket.k)
             equity_point(p1)
             return
         if adverse:
             while basket is not None:
-                stop_lvl = basket.bid_for_money(-p.max_basket_loss_usd, p.spread)
+                stop_lvl = basket.bid_for_money(-p.max_basket_loss_usd * basket.k, p.spread)
                 add_lvl = None
                 rollover = p.no_add_rollover and (
                     (now.hour == 23 and now.minute >= 30) or now.hour == 0 or (now.hour == 1 and now.minute < 30))
@@ -621,7 +637,7 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
                 if add_hit:
                     entry = fill_add + p.spread if basket.side > 0 else fill_add
                     basket.worst = min(basket.worst, basket.pnl(fill_add, p.spread))
-                    basket.entries.append((entry, p.lots))
+                    basket.entries.append((entry, basket.entries[0][1]))
                     cur = fill_add
                     continue
                 break
@@ -633,7 +649,7 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
             hit = p1 >= lvl if basket.side > 0 else p1 <= lvl
             if hit:
                 if p.trail_usd > 0:
-                    basket.floor = max(target, basket.pnl(p1, p.spread) - p.trail_usd)
+                    basket.floor = max(target, basket.pnl(p1, p.spread) - p.trail_usd * basket.k)
                     equity_point(p1)
                     return
                 fill = max(lvl, cur) if basket.side > 0 else min(lvl, cur)
@@ -654,7 +670,8 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
             return "quiet"
         if p.use_d1_filter and sig.d1 == -sig.side:
             return "d1"
-        if p.max_daily_loss_usd > 0 and day_pl.get(now.normalize(), 0.0) <= -p.max_daily_loss_usd:
+        if p.max_daily_loss_usd > 0 and \
+                day_pl.get(now.normalize(), 0.0) <= -p.max_daily_loss_usd * lot_for_balance() / p.lots:
             return "daily"
         if p.max_weekly_loss_usd > 0:
             wk = (now - pd.Timedelta(days=now.weekday())).normalize()
@@ -679,7 +696,7 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
             if (p.add_on_bar_close and basket is not None and len(basket.entries) < p.max_trades
                     and basket.last_pnl(o, p.spread) <= -step_money(basket.entries[-1][1], now)):
                 entry = o + p.spread if basket.side > 0 else o
-                basket.entries.append((entry, p.lots))
+                basket.entries.append((entry, basket.entries[0][1]))
             sig = sig_by_time.get(bar15)
             if sig is not None and sig.side != 0 and confluence(sig, p) >= max(1, p.min_confluence):
                 reason = blocked(now, sig)
@@ -687,11 +704,15 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
                     reason = "cooldown"
                 if not reason and basket is not None:
                     reason = "basket-open"
+                lot = lot_for_balance()
+                if not reason and p.max_stop_pct > 0 and \
+                        p.max_basket_loss_usd * lot / p.lots > p.max_stop_pct / 100.0 * balance:
+                    reason = "balance-too-small"
                 if reason:
                     skips[reason] = skips.get(reason, 0) + 1
                 else:
                     entry = o + p.spread if sig.side > 0 else o
-                    basket = Basket(sig.side, now, [(entry, p.lots)])
+                    basket = Basket(sig.side, now, [(entry, lot)], k=lot / p.lots)
 
         # gap from the previous bar close to this open
         if prev_close is not None and basket is not None:
@@ -700,7 +721,7 @@ def simulate(m1: pd.DataFrame, signals: list[SignalRow], p: Params, balance0: fl
         # 2) weekend close (checked at the bar open)
         if (basket is not None and p.close_before_weekend and now.weekday() == 4
                 and now.hour >= p.weekend_close_hour
-                and basket.pnl(o, p.spread) >= -p.weekend_close_max_loss):
+                and basket.pnl(o, p.spread) >= -p.weekend_close_max_loss * basket.k):
             finish(o, now, "weekend")
 
         # 3) intrabar path

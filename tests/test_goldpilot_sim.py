@@ -90,3 +90,24 @@ def test_deep_basket_uses_deep_target():
     row = res.baskets.iloc[0]
     assert row.trades == 5
     assert row.result == pytest.approx(10.0)
+
+
+def test_auto_lot_scales_lot_and_money_with_balance():
+    # 3000 x 10% = 300 stop = 0.02 lot (150 per 0.01): every $ threshold doubles,
+    # price distances stay the same. Adds at 1990 / 1980 (avg 1990), worst -60 at 1980,
+    # target 20 -> closes at 1990 + 20 / 6 = 1993.33.
+    m1 = bars([2000.0, 1990.0, 1980.0, 1985.0, 1995.0])
+    res = simulate(m1, [buy_signal_at("2026-01-05 10:00")], replace(P, risk_pct=10.0), balance0=3000.0)
+    row = res.baskets.iloc[0]
+    assert row.lot == pytest.approx(0.02)
+    assert row.trades == 3
+    assert row.worst == pytest.approx(-60.0)
+    assert row.result == pytest.approx(20.0)
+
+
+def test_auto_lot_refuses_a_too_small_balance():
+    # $100: even 0.01 lot has a 150 stop = 150% of balance (> 50%)
+    m1 = bars([2000.0, 2004.0, 2008.0, 2012.0])
+    res = simulate(m1, [buy_signal_at("2026-01-05 10:00")], replace(P, risk_pct=10.0), balance0=100.0)
+    assert len(res.baskets) == 0
+    assert res.skips.get("balance-too-small") == 1

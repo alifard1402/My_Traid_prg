@@ -1,6 +1,9 @@
+AutoLot=1
+RiskPerBasketPct=10
 DefaultLots=0.10
-MaxLotPerTrade=0.20
+MaxLotPerTrade=0
 ScaleMoneyToLot=1
+MaxStopPctOfBalance=50
 TakeProfitUSD=10
 StepLossUSD=10
 TrailProfitUSD=10

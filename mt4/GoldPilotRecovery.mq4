@@ -22,10 +22,12 @@
 //|       locked profit) and +10 target for 5-trade baskets          |
 //|     - v4.7: money inputs scale with DefaultLots (cent accounts,   |
 //|       small balances): price distances stay the tested ones      |
+//|     - v4.8: AutoLot - lot of each new basket from the balance so |
+//|       its emergency stop = RiskPerBasketPct of balance (compound)|
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.71"
-#property description "GoldPilot Recovery v4.7 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
+#property version   "4.80"
+#property description "GoldPilot Recovery v4.8 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
 
 enum ENUM_TREND_MODE
 {
@@ -56,7 +58,9 @@ input double   StepATRMult           = 1.5;    // STEP_ATR: step = this x ATR pr
 input ENUM_TIMEFRAMES StepATRTF      = PERIOD_M15; // STEP_ATR: ATR timeframe
 input double   RecoveryRatio         = 0.3333; // Basket target = ratio x worst basket drawdown
 input bool     ScaleMoneyToLot       = true;   // $ inputs are for 0.01 lot of standard gold; scale to DefaultLots and account currency
-input double   MaxStopPctOfBalance   = 50.0;   // Refuse to start if the emergency stop is above this % of balance (0 = no check)
+input double   MaxStopPctOfBalance   = 50.0;   // No basket if its emergency stop is above this % of balance (0 = no check)
+input bool     AutoLot               = true;   // Lot of each new basket from the balance (compounding)
+input double   RiskPerBasketPct      = 10.0;   // AutoLot: emergency stop of a new basket = this % of balance
 input double   TrailProfitUSD        = 10.0;   // At the target, trail the basket profit by this (0 = close at target)
 input int      DeepTrades            = 5;      // Baskets with this many trades use DeepTargetUSD (0 = off)
 input double   DeepTargetUSD         = 10.0;   // Target of deep baskets instead of the 1/3 rule
@@ -75,8 +79,8 @@ input int      PauseAfterStopMinutes = 60;     // No auto entries after an emerg
 input string   s_orders              = "=== Orders ===";
 input int      MagicNumber           = 26091101;
 input bool     ManageManualTrades    = true;   // Manage trades you open by hand (magic 0)
-input double   DefaultLots           = 0.01;   // Lot for BUY/SELL buttons and auto signals
-input double   MaxLotPerTrade        = 0.02;   // No EA order is ever bigger than this
+input double   DefaultLots           = 0.01;   // Lot for BUY/SELL buttons and auto signals when AutoLot = false
+input double   MaxLotPerTrade        = 0;      // No EA order is ever bigger than this (0 = no cap)
 input ENUM_OPPOSITE_ACTION OppositeTradeAction = OPPOSITE_CLOSE; // Trade opposite to the open basket
 input bool     ConfirmButtons        = true;   // Ask before BUY / SELL / CLOSE ALL
 input double   MaxSpreadPrice        = 0.80;   // Max spread in price (0.80 = 80 cents on gold)
@@ -221,6 +225,7 @@ struct BasketInfo
    double   profit;        // profit + swap + commission
    int      lastTicket;
    datetime firstTime;
+   double   firstLots;     // lot of the first trade: sets the money scale of the basket
    datetime lastTime;
    double   lastProfit;
    double   lastLots;
@@ -276,7 +281,8 @@ datetime gBasketStart[2];
 datetime gDirBlockUntil[2];
 bool     gWeekendAlerted[2];
 bool     gTrailOn[2];
-// money settings in account currency, scaled to DefaultLots (ScaleMoneyToLot)
+// money settings in account currency for the basket being handled (SetMoney)
+double   gBasketLots[2];
 double   gScale = 1, gTP = 0, gStep = 0, gStop = 0, gTrail = 0, gDeepTgt = 0, gDaily = 0, gWeekendLoss = 0;
 double   gTrailFloor[2];
 string   gCloseReason[2];
@@ -454,20 +460,36 @@ bool IsWeekendCloseTime()
           TimeHour(TimeCurrent()) >= WeekendCloseHour);
 }
 
-// Account money per 1.0 price move of one DefaultLots trade. 1.0 for 0.01 lot of
-// standard gold in a USD account, so the inputs keep their tested meaning there.
-double MoneyScale()
+double CapLots(double lots)
 {
-   if(!ScaleMoneyToLot) return(1.0);
-   double vpp = ValuePerPrice();
-   double lots = NormalizeLots(MathMin(DefaultLots, MaxLotPerTrade));
-   if(vpp <= 0 || lots <= 0) return(1.0);
-   return(lots * vpp);
+   lots = NormalizeLots(lots);
+   if(MaxLotPerTrade > 0) lots = NormalizeLots(MathMin(lots, MaxLotPerTrade));
+   return(lots);
 }
 
-void InitMoney()
+// Lot of a new basket. AutoLot: its emergency stop (MaxBasketLossUSD per 0.01 lot of
+// standard gold) is RiskPerBasketPct of the balance, rounded down, never below the
+// broker minimum (EntryBlockReason refuses the basket if that minimum is too big).
+double EntryLots()
 {
-   gScale       = MoneyScale();
+   if(!AutoLot) return(CapLots(DefaultLots));
+   double vpp = ValuePerPrice();
+   double bal = AccountBalance();
+   if(vpp <= 0 || bal <= 0 || MaxBasketLossUSD <= 0) return(CapLots(DefaultLots));
+   return(CapLots(bal * RiskPerBasketPct / 100.0 / (MaxBasketLossUSD * vpp)));
+}
+
+// Money settings for a basket whose first trade has `lots`. The $ inputs are for
+// 0.01 lot of standard gold in a USD account (scale 1.0 there), so the price
+// distances stay the tested ones for any lot, account currency or cent account.
+// Without AutoLot the scale follows DefaultLots, as in v4.7 (a manual 0.02 trade
+// still closes at +$10).
+void SetMoney(double lots)
+{
+   if(!AutoLot) lots = CapLots(DefaultLots);
+   double vpp = ValuePerPrice();
+   gScale = 1.0;
+   if((ScaleMoneyToLot || AutoLot) && vpp > 0 && lots > 0) gScale = lots * vpp;
    gTP          = TakeProfitUSD * gScale;
    gStep        = StepLossUSD * gScale;
    gStop        = MaxBasketLossUSD * gScale;
@@ -488,14 +510,15 @@ double Target(int idx, int count)
 //==================================================================
 int OnInit()
 {
-   InitMoney();
+   SetMoney(EntryLots());
    if(gTP <= 0 || gStep <= 0 || gStop <= 0 || MaxTrades < 1 ||
       RecoveryRatio <= 0 || RecoveryRatio > 1 || RecoveryLotMultiplier <= 0 || DefaultLots <= 0 ||
-      gTrail < 0 || gDeepTgt < 0 ||
-      MaxLotPerTrade < DefaultLots)
+      gTrail < 0 || gDeepTgt < 0 || (AutoLot && RiskPerBasketPct <= 0) ||
+      (MaxLotPerTrade > 0 && MaxLotPerTrade < DefaultLots))
    {
       Alert("GoldPilot Recovery: invalid money settings. TakeProfitUSD, StepLossUSD, ",
-            "MaxBasketLossUSD, MaxTrades, lots must be > 0, RecoveryRatio in (0,1], MaxLotPerTrade >= DefaultLots.");
+            "MaxBasketLossUSD, MaxTrades, lots, RiskPerBasketPct must be > 0, RecoveryRatio in (0,1], " +
+            "MaxLotPerTrade 0 or >= DefaultLots.");
       return(INIT_PARAMETERS_INCORRECT);
    }
 
@@ -505,15 +528,16 @@ int OnInit()
             ") is reached before trade #", MaxTrades, " can open (basket is already at -",
             DoubleToString(lossAtLastAdd, 2), " then).");
    double balance = AccountBalance();
-   Print(StringFormat("Money scale %.4f (%s): target %.2f, step %.2f, emergency stop %.2f %s = %.1f%% of balance",
-                      gScale, ScaleMoneyToLot ? "scaled to DefaultLots" : "inputs as is", gTP, gStep, gStop,
+   Print(StringFormat("Lot %.2f (%s), money scale %.4f: target %.2f, step %.2f, emergency stop %.2f %s = %.1f%% of balance",
+                      EntryLots(), AutoLot ? StringFormat("auto %.1f%%", RiskPerBasketPct) : "fixed",
+                      gScale, gTP, gStep, gStop,
                       AccountCurrency(), balance > 0 ? gStop / balance * 100 : 0));
    // Backtests showed a $100 account at 0.01 lot (stop = 150% of balance) was wiped out
    // from about 40% of start dates. Refuse to run with such an oversized stop.
    if(MaxStopPctOfBalance > 0 && balance > 0 && gStop > MaxStopPctOfBalance / 100.0 * balance)
    {
       Alert(StringFormat("GoldPilot NOT started: emergency stop %.2f is %.0f%% of the balance (limit %.0f%%). " +
-                         "Use a smaller DefaultLots / a cent account, or raise MaxStopPctOfBalance.",
+                         "Use a cent account, a smaller DefaultLots, or raise MaxStopPctOfBalance.",
                          gStop, gStop / balance * 100, MaxStopPctOfBalance));
       return(INIT_PARAMETERS_INCORRECT);
    }
@@ -536,6 +560,7 @@ int OnInit()
       gWeekendAlerted[i]  = false;
       gTrailOn[i]         = false;
       gTrailFloor[i]      = 0;
+      gBasketLots[i]      = 0;
    }
    if(IsTesting() && WriteJournal) FileDelete(JOURNAL);   // fresh journal per test run
 
@@ -550,7 +575,7 @@ int OnInit()
    UpdateDashboard();
 
    DataCheck();
-   Print("GoldPilot Recovery v4.7 started on ", Symbol(), " ", TFName(SignalTF),
+   Print("GoldPilot Recovery v4.8 started on ", Symbol(), " ", TFName(SignalTF),
          " | $1 price move per 1 lot = ", DoubleToString(ValuePerPrice(), 2));
    return(INIT_SUCCEEDED);
 }
@@ -1401,7 +1426,11 @@ string EntryBlockReason()
       return(StringFormat("volatility x%.1f", gATRRatio));
    if(MinATRRatio > 0 && gATRRatio > 0 && gATRRatio < MinATRRatio)
       return(StringFormat("quiet x%.2f", gATRRatio));
+   SetMoney(EntryLots());
    if(gDaily > 0 && TodayClosedPL() <= -gDaily) return("daily loss limit");
+   double bal = AccountBalance();
+   if(MaxStopPctOfBalance > 0 && bal > 0 && gStop > MaxStopPctOfBalance / 100.0 * bal)
+      return("balance too small");
    if(!SpreadOK()) return("spread");
    return("");
 }
@@ -1431,7 +1460,7 @@ void TryAutoEntry()
    ScanBasket(OP_SELL, s);
    if(b.count > 0 || s.count > 0) { AddSkip("basket-open"); return; }   // one basket at a time
 
-   if(OpenMarket(type, DefaultLots, "GPR signal")) gDiagOpened++;
+   if(OpenMarket(type, EntryLots(), "GPR signal")) gDiagOpened++;
    else AddSkip("order-failed");
 }
 
@@ -1490,7 +1519,7 @@ void EnforceOneDirection()
 void ScanBasket(int type, BasketInfo &b)
 {
    b.count = 0; b.lots = 0; b.sumLotsOpen = 0; b.fees = 0; b.profit = 0;
-   b.lastTicket = -1; b.firstTime = 0; b.lastTime = 0; b.lastProfit = 0; b.lastLots = 0;
+   b.lastTicket = -1; b.firstTime = 0; b.firstLots = 0; b.lastTime = 0; b.lastProfit = 0; b.lastLots = 0;
    b.lastOpen = 0; b.lastFees = 0;
 
    for(int i = OrdersTotal() - 1; i >= 0; i--)
@@ -1505,7 +1534,12 @@ void ScanBasket(int type, BasketInfo &b)
       b.sumLotsOpen += OrderLots() * OrderOpenPrice();
       b.fees        += fee;
       b.profit      += pr;
-      if(b.firstTime == 0 || OrderOpenTime() < b.firstTime) b.firstTime = OrderOpenTime();
+      if(b.firstTime == 0 || OrderOpenTime() < b.firstTime ||
+         (OrderOpenTime() == b.firstTime && OrderLots() > b.firstLots))
+      {
+         b.firstTime = OrderOpenTime();
+         b.firstLots = OrderLots();
+      }
 
       if(OrderOpenTime() > b.lastTime ||
          (OrderOpenTime() == b.lastTime && OrderTicket() > b.lastTicket))
@@ -1556,6 +1590,8 @@ void ManageBasket(int type)
    }
 
    if(gBasketStart[idx] == 0) { gBasketStart[idx] = b.firstTime; gCloseReason[idx] = ""; }
+   gBasketLots[idx] = b.firstLots;
+   SetMoney(b.firstLots);
    if(b.profit < gWorst[idx]) { gWorst[idx] = b.profit; SaveWorst(idx); }
    double target = Target(idx, b.count);
 
@@ -1625,7 +1661,7 @@ void ManageBasket(int type)
             if(SpreadOK() && TimeCurrent() - gLastOpenTry[idx] >= 5)
             {
                gLastOpenTry[idx] = TimeCurrent();
-               double lots = NormalizeLots(MathMin(b.lastLots * RecoveryLotMultiplier, MaxLotPerTrade));
+               double lots = CapLots(b.lastLots * RecoveryLotMultiplier);
                if(OpenMarket(type, lots, StringFormat("GPR rec %d", b.count + 1)))
                {
                   Notify(StringFormat("%s recovery %s #%d opened (%.2f lot). Basket P/L %.2f",
@@ -1673,6 +1709,7 @@ void FinishBasket(int type)
       if(OrderCloseTime() > lastClose) lastClose = OrderCloseTime();
    }
 
+   SetMoney(gBasketLots[idx]);
    string reason = gCloseReason[idx];
    if(reason == "")   // closed on the server (TP/SL) or by hand
    {
@@ -1718,10 +1755,11 @@ void WriteJournalRow(int type, datetime start, datetime end, int trades,
       return;
    }
    if(FileSize(h) == 0)
-      FileWrite(h, "open_time", "close_time", "symbol", "side", "trades", "worst", "result", "reason", "minutes");
+      FileWrite(h, "open_time", "close_time", "symbol", "side", "trades", "worst", "result", "reason", "minutes", "lot", "balance");
    FileSeek(h, 0, SEEK_END);
    FileWrite(h, TimeToString(start), TimeToString(end), Symbol(), Side(type), trades,
-             DoubleToString(worst, 2), DoubleToString(result, 2), reason, (int)((end - start) / 60));
+             DoubleToString(worst, 2), DoubleToString(result, 2), reason, (int)((end - start) / 60),
+             DoubleToString(gBasketLots[Idx(type)], 2), DoubleToString(AccountBalance(), 2));
    FileClose(h);
 }
 
@@ -1786,7 +1824,7 @@ bool OpenMarket(int type, double lots, string comment)
       Print("Trading not allowed (enable AutoTrading).");
       return(false);
    }
-   lots = NormalizeLots(MathMin(lots, MaxLotPerTrade));
+   lots = CapLots(lots);
 
    ResetLastError();
    if(AccountFreeMarginCheck(Symbol(), type, lots) <= 0 || GetLastError() == ERR_NOT_ENOUGH_MONEY)
@@ -1905,13 +1943,15 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
    }
    else if(sparam == BTN_BUY)
    {
-      if(Confirm(StringFormat("BUY %.2f lot %s ?", DefaultLots, Symbol())))
-         OpenMarket(OP_BUY, DefaultLots, "GPR button");
+      double lots = EntryLots();
+      if(Confirm(StringFormat("BUY %.2f lot %s ?", lots, Symbol())))
+         OpenMarket(OP_BUY, lots, "GPR button");
    }
    else if(sparam == BTN_SELL)
    {
-      if(Confirm(StringFormat("SELL %.2f lot %s ?", DefaultLots, Symbol())))
-         OpenMarket(OP_SELL, DefaultLots, "GPR button");
+      double lots = EntryLots();
+      if(Confirm(StringFormat("SELL %.2f lot %s ?", lots, Symbol())))
+         OpenMarket(OP_SELL, lots, "GPR button");
    }
    else if(Confirm("Close ALL managed " + Symbol() + " trades?"))
    {
@@ -2090,6 +2130,7 @@ void BasketRows(int &y, int type)
       return;
    }
 
+   SetMoney(b.firstLots);
    double worst = MathMin(gWorst[idx], b.profit);
    double target = (DeepTrades > 0 && b.count >= DeepTrades) ? gDeepTgt
                                                              : MathMax(gTP, RecoveryRatio * (-worst));
@@ -2115,7 +2156,7 @@ void UpdateDashboard()
    int y = DashY;
    string tf = TFName(SignalTF);
 
-   Row(y, "title", "GoldPilot Recovery v4.7  " + Symbol() + " " + tf, clrGold);
+   Row(y, "title", "GoldPilot Recovery v4.8  " + Symbol() + " " + tf, clrGold);
 
    string trendTxt = (gTrend > 0) ? "BULLISH" : (gTrend < 0) ? "BEARISH" : "NEUTRAL - wait";
    Row(y, "trend", "Trend: " + trendTxt, TrendColor(gTrend));
@@ -2161,9 +2202,13 @@ void UpdateDashboard()
    Row(y, "sep2", "------------------------------------", clrDimGray);
 
    double vpp = ValuePerPrice();
-   double stepMoney = StepMoney(DefaultLots);
-   double stepDist = (vpp > 0) ? stepMoney / (vpp * DefaultLots) : 0;
-   Row(y, "step", StringFormat("Step $%.2f = %.2f price @ %.2f lot%s", stepMoney, stepDist, DefaultLots,
+   double newLots = EntryLots();
+   SetMoney(newLots);
+   double stepMoney = StepMoney(newLots);
+   double stepDist = (vpp > 0) ? stepMoney / (vpp * newLots) : 0;
+   Row(y, "lot", AutoLot ? StringFormat("Next lot %.2f (auto, stop = %.1f%% of balance)", newLots, RiskPerBasketPct)
+                         : StringFormat("Next lot %.2f (fixed)", newLots), clrSilver);
+   Row(y, "step", StringFormat("Step $%.2f = %.2f price @ %.2f lot%s", stepMoney, stepDist, newLots,
                                StepMode == STEP_ATR ? " (ATR)" : ""), clrSilver);
    double bal = AccountBalance();
    double riskPct = (bal > 0) ? gStop / bal * 100 : 0;
