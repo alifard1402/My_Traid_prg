@@ -24,10 +24,12 @@
 //|       small balances): price distances stay the tested ones      |
 //|     - v4.8: AutoLot - lot of each new basket from the balance so |
 //|       its emergency stop = RiskPerBasketPct of balance (compound)|
+//|     - v4.81: health alerts when the account does worse than in   |
+//|       any backtest (drawdown, emergency stops close together)    |
 //+------------------------------------------------------------------+
 #property strict
-#property version   "4.80"
-#property description "GoldPilot Recovery v4.8 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
+#property version   "4.81"
+#property description "GoldPilot Recovery v4.81 - S/R, trendlines, supply/demand, sweeps, FVG + basket recovery manager"
 
 enum ENUM_TREND_MODE
 {
@@ -123,6 +125,14 @@ input bool     CloseBeforeWeekend    = true;   // Friday: close the basket if it
 input int      WeekendCloseHour      = 21;     // Friday server hour for the weekend close
 input double   WeekendCloseMaxLossUSD = 20.0;  // Close only if basket P/L >= -this (deeper: keep + alert)
 input bool     WriteJournal          = true;   // Log every basket to MQL4/Files/GoldPilot_baskets.csv
+
+//==================================================================
+//                HEALTH MONITOR (alerts only, no trading change)
+//==================================================================
+input string   s_health              = "=== Health monitor (alerts only) ===";
+input double   WarnDrawdownPct       = 40.0;   // Alert when equity is this % below its peak (backtests: <= ~33%; 0 = off)
+input int      WarnStops             = 4;      // Alert at this many emergency stops ...
+input int      WarnStopsDays         = 7;      // ... within this many days (backtests: max 3; 0 = off)
 
 //==================================================================
 //                           ANALYSIS
@@ -287,6 +297,11 @@ double   gScale = 1, gTP = 0, gStep = 0, gStop = 0, gTrail = 0, gDeepTgt = 0, gD
 double   gTrailFloor[2];
 string   gCloseReason[2];
 int      gWins = 0, gLosses = 0, gStops = 0;
+// health monitor: peak of (equity - net deposits), so deposits / withdrawals are not drawdown
+double   gPeakTrade = 0, gDeposits = 0, gHealthDD = 0, gMaxHealthDD = 0;
+bool     gPeakInit = false, gDDWarned = false;
+int      gHistCount = -1;
+datetime gStopTimes[10];
 double   gNet = 0, gWorstEver = 0;
 
 //==================================================================
@@ -429,6 +444,83 @@ void SaveWorst(int idx)
    else GlobalVariableSet(n, gWorst[idx]);
 }
 
+string HealthName(string what)
+{
+   return(StringFormat("GPR_%s_%d_%s", Symbol(), MagicNumber, what));
+}
+
+// Deposits minus withdrawals in the account history (set the Account History tab to
+// "All History" so old deposits are included). Recounted only when the history changes.
+double NetDeposits()
+{
+   int n = OrdersHistoryTotal();
+   if(n == gHistCount) return(gDeposits);
+   gHistCount = n;
+   gDeposits = 0;
+   for(int i = 0; i < n; i++)
+      if(OrderSelect(i, SELECT_BY_POS, MODE_HISTORY) && OrderType() == 6) gDeposits += OrderProfit();
+   return(gDeposits);
+}
+
+void CheckHealth()
+{
+   double dep = NetDeposits();
+   double adj = AccountEquity() - dep;
+   string n = HealthName("peak");
+   if(!gPeakInit)
+   {
+      gPeakTrade = adj;
+      if(!IsTesting() && GlobalVariableCheck(n)) gPeakTrade = MathMax(adj, GlobalVariableGet(n));
+      gPeakInit = true;
+   }
+   if(adj > gPeakTrade)
+   {
+      gPeakTrade = adj;
+      if(!IsTesting()) GlobalVariableSet(n, gPeakTrade);
+   }
+   double base = gPeakTrade + dep;
+   gHealthDD = (base > 0) ? (gPeakTrade - adj) / base * 100 : 0;
+   gMaxHealthDD = MathMax(gMaxHealthDD, gHealthDD);
+   if(WarnDrawdownPct <= 0) return;
+   if(!gDDWarned && gHealthDD >= WarnDrawdownPct)
+   {
+      gDDWarned = true;
+      Notify(StringFormat("GoldPilot WARNING: equity %.1f%% below its peak (alert at %.0f%%, backtests stayed under ~33%%). " +
+                          "The market may have changed: check the EA and consider stopping it.", gHealthDD, WarnDrawdownPct));
+   }
+   if(gHealthDD < WarnDrawdownPct / 2) gDDWarned = false;
+}
+
+int RecentStops()
+{
+   int n = 0;
+   for(int i = 0; i < 10; i++)
+      if(gStopTimes[i] > 0 && TimeCurrent() - gStopTimes[i] <= WarnStopsDays * 86400) n++;
+   return(n);
+}
+
+void RecordStop()
+{
+   int i;
+   for(i = 9; i > 0; i--) gStopTimes[i] = gStopTimes[i - 1];
+   gStopTimes[0] = TimeCurrent();
+   if(!IsTesting())
+      for(i = 0; i < 10; i++) GlobalVariableSet(HealthName("stop" + IntegerToString(i)), (double)gStopTimes[i]);
+   int n = RecentStops();
+   if(WarnStops > 0 && WarnStopsDays > 0 && n >= WarnStops)
+      Notify(StringFormat("GoldPilot WARNING: %d emergency stops in %d days (backtests: never more than 3). " +
+                          "Consider pausing the EA until the market calms down.", n, WarnStopsDays));
+}
+
+void LoadStops()
+{
+   for(int i = 0; i < 10; i++)
+   {
+      string n = HealthName("stop" + IntegerToString(i));
+      gStopTimes[i] = (!IsTesting() && GlobalVariableCheck(n)) ? (datetime)GlobalVariableGet(n) : (datetime)0;
+   }
+}
+
 string BlockName(int idx)
 {
    return(StringFormat("GPR_%s_%d_%s_block", Symbol(), MagicNumber, idx == 0 ? "buy" : "sell"));
@@ -563,6 +655,11 @@ int OnInit()
       gBasketLots[i]      = 0;
    }
    if(IsTesting() && WriteJournal) FileDelete(JOURNAL);   // fresh journal per test run
+   LoadStops();
+   gPeakInit = false;
+   gDDWarned = false;
+   gHistCount = -1;
+   gMaxHealthDD = 0;
 
    ParseNews();
    ObjectsDeleteAll(0, PREFIX);
@@ -575,7 +672,7 @@ int OnInit()
    UpdateDashboard();
 
    DataCheck();
-   Print("GoldPilot Recovery v4.8 started on ", Symbol(), " ", TFName(SignalTF),
+   Print("GoldPilot Recovery v4.81 started on ", Symbol(), " ", TFName(SignalTF),
          " | $1 price move per 1 lot = ", DoubleToString(ValuePerPrice(), 2));
    return(INIT_SUCCEEDED);
 }
@@ -668,6 +765,8 @@ void OnDeinit(const int reason)
                          gDiagBars, gDiagNoData, gDiagTrendBars, gDiagSignals, gDiagOpened, SkipSummary()));
    Print(StringFormat("GoldPilot stats: baskets %d won / %d lost (emergency stops %d) | net %+.2f | worst basket drawdown %.2f",
                       gWins, gLosses, gStops, gNet, gWorstEver));
+   Print(StringFormat("GoldPilot health: max equity drawdown from peak %.1f%% (alert at %.0f%%)",
+                      gMaxHealthDD, WarnDrawdownPct));
    EventKillTimer();
    ObjectsDeleteAll(0, PREFIX);
    ChartRedraw(0);
@@ -692,6 +791,7 @@ void OnTick()
    EnforceOneDirection();
    ManageBasket(OP_BUY);
    ManageBasket(OP_SELL);
+   CheckHealth();
 
    // The timer does not run in the Strategy Tester.
    if(IsTesting() && IsVisualMode()) UpdateDashboard();
@@ -1724,6 +1824,7 @@ void FinishBasket(int type)
    if(stopped)
    {
       gStops++;
+      RecordStop();
       gPauseUntil = TimeCurrent() + PauseAfterStopMinutes * 60;
       if(DirectionCooldownHours > 0)
       {
@@ -2156,7 +2257,7 @@ void UpdateDashboard()
    int y = DashY;
    string tf = TFName(SignalTF);
 
-   Row(y, "title", "GoldPilot Recovery v4.8  " + Symbol() + " " + tf, clrGold);
+   Row(y, "title", "GoldPilot Recovery v4.81  " + Symbol() + " " + tf, clrGold);
 
    string trendTxt = (gTrend > 0) ? "BULLISH" : (gTrend < 0) ? "BEARISH" : "NEUTRAL - wait";
    Row(y, "trend", "Trend: " + trendTxt, TrendColor(gTrend));
@@ -2221,6 +2322,10 @@ void UpdateDashboard()
        clrSilver);
    Row(y, "stats", StringFormat("Baskets %dW/%dL stops %d net %+.2f", gWins, gLosses, gStops, gNet),
        clrSilver);
+   int recent = RecentStops();
+   Row(y, "health", StringFormat("Drawdown from peak %.1f%% | stops %dd: %d", gHealthDD, WarnStopsDays, recent),
+       (WarnDrawdownPct > 0 && gHealthDD >= WarnDrawdownPct) || (WarnStops > 0 && recent >= WarnStops) ? clrRed :
+       gHealthDD >= 25 ? clrOrange : clrSilver);
    string cool = "";
    if(TimeCurrent() < gDirBlockUntil[0]) cool += "BUY " + TimeToString(gDirBlockUntil[0], TIME_DATE | TIME_MINUTES) + " ";
    if(TimeCurrent() < gDirBlockUntil[1]) cool += "SELL " + TimeToString(gDirBlockUntil[1], TIME_DATE | TIME_MINUTES);
